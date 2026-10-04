@@ -2,8 +2,8 @@
 // Standalone bootstrap: only Node built-ins; no source build or app server.
 import path from 'node:path';
 import os from 'node:os';
-import { existsSync, createWriteStream } from 'node:fs';
-import { realpath, mkdtemp, unlink, rmdir } from 'node:fs/promises';
+import { existsSync, createWriteStream, constants } from 'node:fs';
+import { realpath, mkdtemp, mkdir, copyFile, readFile, unlink, rmdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 
 const packageName = '@cjfclonedeep/capability-sdk';
-const defaultVersion = '0.3.1';
+const defaultVersion = '0.3.2';
 const releaseRoot = 'https://github.com/cyxysky/capability-sdk/releases/download';
 const help = `Install Capability SDK and connect it to your existing agents.
 Usage: node install.mjs [options]
@@ -97,7 +97,17 @@ async function main() {
         hash.update(chunk); callback(null, chunk);
       } }), createWriteStream(temporaryPackage, { flags: 'wx' }));
       if (hash.digest('hex').toLowerCase() !== checksum.toLowerCase()) throw new Error('Release checksum mismatch. The package was not installed.');
-      packageSource = temporaryPackage;
+      // npm records local archives in package.json and package-lock.json. Keep
+      // the verified archive so a later npm install/ci can resolve that source.
+      const packageCache = path.join(project, '.capability-sdk', 'packages');
+      await mkdir(packageCache, { recursive: true });
+      packageSource = path.join(packageCache, `${checksum.toLowerCase()}-${filename}`);
+      try { await copyFile(temporaryPackage, packageSource, constants.COPYFILE_EXCL); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const cachedHash = createHash('sha256').update(await readFile(packageSource)).digest('hex');
+        if (cachedHash !== checksum.toLowerCase()) throw new Error('The cached release package has a different checksum.');
+      }
     }
     await new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [npm, ...argsFor(packageSource)], {
