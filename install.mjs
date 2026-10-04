@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 
 const packageName = '@cjfclonedeep/capability-sdk';
-const defaultVersion = '0.3.7';
+const defaultVersion = '0.3.8';
 const releaseRoot = 'https://github.com/cyxysky/capability-sdk/releases/download';
 const help = `Install Capability SDK and connect it to your existing agents.
 Usage: node install.mjs [options]

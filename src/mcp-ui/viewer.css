@@ -1,7 +1,6 @@
 body{margin:0;background:var(--color-background-primary,#fff);color:var(--color-text-primary,#182435);font:14px/1.5 var(--font-sans,system-ui,sans-serif)}
 .capability-viewer{box-sizing:border-box;width:100%;margin:0;padding:0;min-width:0}
-.capability-viewer>figure{margin:0}
-.capability-viewer>.capability-chart-interactive,.capability-viewer>.capability-excalidraw{margin:0}
+.capability-viewer.capability-viewer>figure{margin:0}
 .capability-viewer>[role=alert]{color:#b42318;padding:12px;overflow-wrap:anywhere}
 /* A host-expanded iframe is distinct from the browser's :fullscreen element. */
 html[data-capability-layout=fill],html[data-capability-layout=fill] body,html[data-capability-layout=fill] #root{height:100%;min-height:0}
