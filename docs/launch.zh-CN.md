@@ -1,6 +1,6 @@
 # 发布介绍与演示草稿
 
-以下材料供维护者审阅；尚未发到外部社区。先发布仓库和 0.3.1、验证真实安装，再把占位内容替换为实测链接。
+以下材料供维护者审阅；尚未发到外部社区。仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，首个独立版本为 0.3.1。大规模传播前仍需在干净的 Windows 与受支持 Linux 上验证完整运行环境安装。
 
 ## 项目一句话
 
@@ -20,9 +20,17 @@ GitHub 简介：
 
 支持两条接入路径：为 Cursor、Codex、Claude Code 等客户端配置 MCP，或在自己的 Node.js Agent 中挂载需要的工具。模型和任务编排由你现有的 Agent 负责。
 
-下面放三个实际演示和输入/输出文件：网页信息提取、Excel 数据处理、PDF 读取。仓库附安装脚本与可运行示例，欢迎提真实接入问题。
+仓库附安装脚本、完整工具说明，以及无需模型 API 的浏览器调用示例，欢迎提真实接入问题。
 
-仓库、安装命令、许可证和演示链接：发布后补齐。
+仓库：https://github.com/cyxysky/capability-sdk
+
+许可证：MIT。Windows 一行安装：
+
+```powershell
+irm https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.ps1 | iex
+```
+
+需要 Node.js >=22.16 和 npm；首次完整安装会下载数 GB 的运行环境。受支持 Linux 的命令与平台说明见 README。
 
 ## English launch draft
 
@@ -32,9 +40,17 @@ It gives existing agents browser automation, Office/PDF file operations, termina
 
 Connect a supported MCP client, or mount selected tools directly in a Node.js agent. Bring your own model and orchestration.
 
-The repository includes installers and runnable examples. I am sharing reproducible browser, spreadsheet and document demos, with their inputs and outputs. Feedback from actual integrations is welcome.
+The repository includes installers, tool documentation and a browser example that runs without a model API. Feedback from actual integrations is welcome.
 
-Repository, license, installation command and demo links: add after the release is live.
+Repository: https://github.com/cyxysky/capability-sdk (MIT).
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.ps1 | iex
+```
+
+Requires Node.js >=22.16 with npm. Full runtime preparation downloads several GB. See the README for supported Linux systems and their installer.
 
 ## 先完成的三个演示
 
