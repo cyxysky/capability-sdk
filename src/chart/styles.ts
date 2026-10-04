@@ -56,7 +56,7 @@ export const chartStyles = `
 .capability-chart-edit-status.is-dirty{color:#9b8055}
 .capability-chart-edit-status.is-dirty:before{content:'';width:5px;height:5px;border-radius:50%;background:#d8a354}
 .capability-chart-editor-body{display:flex;flex:1;min-height:0;overflow:hidden}
-.capability-chart-data-nav{width:196px;flex:none;overflow:auto;padding:18px 10px;background:#fafbfe;border-right:1px solid #edf0f5}
+.capability-chart-data-nav{display:block;width:196px;flex:none;margin:0;overflow:auto;padding:18px 10px;background:#fafbfe;border-right:1px solid #edf0f5}
 .capability-chart-data-nav>p{display:flex;align-items:center;gap:6px;margin:0 10px 12px!important;letter-spacing:.02em}
 .capability-chart-data-nav>p>span{font-size:10px;padding:0 5px;background:#e9edf4;color:#7f8ba0;border-radius:4px}
 .capability-chart-data-nav>button{display:flex;justify-content:flex-start;text-align:left;gap:10px;width:100%;padding:11px 10px;margin:0 0 4px;border-radius:8px;color:#8a96aa}

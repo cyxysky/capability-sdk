@@ -8,15 +8,10 @@ import { normalizeChartUpdate, normalizeExcalidrawOption } from './core.ts';
 import type { ChartRendererProps } from './react.tsx';
 import { defaultChartTranslate } from './i18n.ts';
 import { ChartIcon } from './icons.tsx';
+import { downloadChartFile } from './download.ts';
 
-function download(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url; anchor.download = name; document.body.append(anchor); anchor.click(); anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, translate: t = defaultChartTranslate, excalidraw }: ChartRendererProps) {
+export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDownload, translate: t = defaultChartTranslate, excalidraw }: ChartRendererProps) {
+  const download = (data: Blob | string, name: string) => downloadChartFile(data, name, onDownload);
   const [current, setCurrent] = useState(chart);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -129,7 +124,7 @@ export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, trans
       <div className="capability-excalidraw-download-menu">
       <button type="button" onClick={() => act(() => {
         const scene = snapshot();
-        download(new Blob([serializeAsJSON(scene.elements, scene.appState, scene.files, 'local')], { type: 'application/json' }), `${name}.excalidraw`);
+        return download(new Blob([serializeAsJSON(scene.elements, scene.appState, scene.files, 'local')], { type: 'application/json' }), `${name}.excalidraw`);
       })}><ChartIcon name="code" />Excalidraw</button>
       <button type="button" onClick={() => act(async () => download(await exportToBlob({ ...snapshot(), mimeType: 'image/png' }), `${name}.png`))}><ChartIcon name="image" />PNG</button>
       <button type="button" onClick={() => act(async () => download(new Blob([(await exportToSvg(snapshot())).outerHTML], { type: 'image/svg+xml' }), `${name}.svg`))}><ChartIcon name="image" />SVG</button>

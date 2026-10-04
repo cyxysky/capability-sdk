@@ -1,6 +1,6 @@
 {
     "name":  "@cjfclonedeep/capability-sdk",
-    "version":  "0.3.3",
+    "version":  "0.3.4",
     "license":  "MIT",
     "description":  "Give existing agents browser, Office, terminal, code, charts and knowledge tools through one SDK or MCP server.",
     "repository":  {

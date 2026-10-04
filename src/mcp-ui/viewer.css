@@ -1,0 +1,13 @@
+body{margin:0;background:var(--color-background-primary,#f8fafc);color:var(--color-text-primary,#182435);font:14px/1.5 var(--font-sans,system-ui,sans-serif)}
+.capability-viewer{box-sizing:border-box;max-width:1280px;margin:auto;padding:16px;min-width:0}
+.capability-viewer-toolbar{display:flex;align-items:center;gap:8px;margin:0 0 12px;padding:0;flex-wrap:wrap}
+.capability-viewer-toolbar>span{flex:1}
+.capability-viewer-toolbar>button{cursor:pointer;border:1px solid var(--color-border-primary,#cbd5e1);border-radius:8px;background:var(--color-background-secondary,#fff);color:inherit;padding:6px 10px;font:inherit;white-space:nowrap}
+.capability-viewer-toolbar>button:hover{background:var(--color-background-tertiary,#edf2f7)}
+.capability-viewer-toolbar>button:focus-visible{outline:2px solid #5477ed;outline-offset:2px}
+.capability-viewer-footer{padding:10px 0 0;color:var(--color-text-secondary,#667085);font-size:12px;line-height:1.6}
+.capability-viewer>[role=alert]{color:#b42318;padding:12px;overflow-wrap:anywhere}
+.map-fallback{background:#fff;color:#182435;border:1px solid #dbe2ea;border-radius:16px;padding:24px}
+.map-fallback svg{width:100%;max-height:450px}
+.map-fallback a{color:#315d9c}
+@media(max-width:640px){.capability-viewer{padding:10px}.capability-viewer-toolbar{font-size:12px}.capability-viewer-footer{font-size:11px}}

@@ -92,6 +92,12 @@ npx --no-install capability-mcp --describe-config
 
 file 默认开启 visualInputAvailable。生成并 render 文件后，使用 visualIndex 获取页索引、visualRead 读取实际页面图片、visualReport 提交核对结论；MCP 返回 image 内容块，而不仅是截图路径。视觉核对与当前源版本关联，修改后必须重新 render/read/report。配置 visualInputAvailable=false 可对不支持图像的客户端禁用；禁用不代表已经完成视觉核对。
 
+## 图片、视频与语音生成
+
+默认 \`media.listModels\` 会列出内置 Codex 图片模型，\`generateImage\` 复用本机已登录账号，不需要另填 API Key。要求 Codex CLI >=0.142；Windows 优先检查 Codex 桌面应用自带程序，其次使用 PATH。可通过 \`tools.media.codexPath\` 或 \`CAPABILITY_CODEX_PATH\` 指定程序。设置 \`codexImage=false\` 可关闭内置模型。账号是否支持原生图片工具，需要实际生成验证。
+
+独立 MCP 不读取宿主 agent 的模型配置。要接入其他图片、视频或语音模型，设置 \`tools.media.modelsFile\` 指向项目内 JSON，结构为 \`{models: [...], defaults: {...}}\`，模型字段见 \`docs/media/README.zh-CN.md\`。每个模型可将 \`apiKey\` 改为 \`apiKeyEnv\`，引用 MCP 进程的环境变量；不要把密钥放进工具参数或提交到仓库。自定义模型排在内置模型之前，defaults 可指定默认模型配置 ID。
+
 ## 字段参考
 
 下表默认值在没有显式配置和对应环境变量时生效。computer.enabled 默认按平台和 endpoint 判断。路径相对于项目根目录；时间单位为毫秒。所有修改都按重新启动 MCP 后的行为说明。

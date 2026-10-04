@@ -16,6 +16,7 @@ export async function createMcpVisualization({ tools, invoke, options = {} }) {
   if (!visualTools.size || options.enabled === false) return undefined;
   const template = await readFile(new URL('viewer.html', root), 'utf8');
   const views = new Map(); const byArtifact = new Map();
+  const exports = new Map();
   const serviceKey = randomBytes(24).toString('hex');
   let http; let origin; let starting; let closing = false;
 
@@ -55,10 +56,33 @@ export async function createMcpVisualization({ tools, invoke, options = {} }) {
     if (segments[1] === 'fonts' && req.method === 'GET') {
       const bytes = await readExcalidrawFont(segments.slice(1));
       if (!bytes) return json(res,404,{error:'Font not found'});
-      res.writeHead(200,{'content-type':'font/woff2','cache-control':'private, max-age=3600'});return res.end(bytes);
+      res.writeHead(200,{'content-type':'font/woff2','cache-control':'private, max-age=3600','access-control-allow-origin':'*'});return res.end(bytes);
     }
     const view = views.get(segments[1]);
     if (!view) return json(res,404,{error:'Preview expired; call chart/maps again'});
+    if (segments[2] === 'exports') {
+      res.setHeader('access-control-allow-origin','*');
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204,{'access-control-allow-methods':'POST','access-control-allow-headers':'content-type'});return res.end();
+      }
+      if (segments.length === 3 && req.method === 'POST') {
+        const type = req.headers['content-type'] || '';
+        if (!/^(image\/(png|svg\+xml)|application\/json|text\/csv)(;|$)/.test(type)) return json(res,400,{error:'Unsupported export format'});
+        const chunks=[];let size=0;
+        for await(const chunk of req){size+=chunk.length;if(size>20*1024*1024)return json(res,413,{error:'Export exceeds 20 MiB'});chunks.push(chunk);}
+        const key=randomBytes(24).toString('hex');
+        const filename=(url.searchParams.get('filename') || 'chart').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,150);
+        exports.set(key,{token:view.token,type,filename,bytes:Buffer.concat(chunks),expires:Date.now()+600000});
+        for(const [id,file] of exports)if(file.expires<Date.now())exports.delete(id);
+        while(exports.size>8)exports.delete(exports.keys().next().value);
+        return json(res,200,{url:`${origin}/${serviceKey}/${view.token}/exports/${key}`});
+      }
+      const file=exports.get(segments[3]);
+      if(req.method==='GET' && segments.length===4 && file?.token===view.token && file.expires>Date.now()){
+        res.writeHead(200,{'content-type':file.type,'cache-control':'no-store','content-disposition':`attachment; filename="chart.${file.filename.split('.').at(-1)}"; filename*=UTF-8''${encodeURIComponent(file.filename)}`});return res.end(file.bytes);
+      }
+      return json(res,404,{error:'Export expired; export the chart again'});
+    }
     if (segments[2] === 'data' && req.method === 'GET') return json(res,200,await payload(view));
     if (segments[2] === 'data' && req.method === 'POST') {
       if (req.headers.origin !== origin || req.headers['content-type'] !== 'application/json') return json(res,403,{error:'Invalid preview request origin'});
@@ -106,6 +130,6 @@ export async function createMcpVisualization({ tools, invoke, options = {} }) {
       return { _meta:{'capability/visualization':initial},
         content };
     },
-    async close(){closing=true;views.clear();byArtifact.clear();if(starting)await starting.catch(()=>{});if(http?.listening){http.closeAllConnections();await new Promise(resolve=>http.close(resolve));}},
+    async close(){closing=true;views.clear();byArtifact.clear();exports.clear();if(starting)await starting.catch(()=>{});if(http?.listening){http.closeAllConnections();await new Promise(resolve=>http.close(resolve));}},
   };
 }

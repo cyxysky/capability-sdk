@@ -89,6 +89,12 @@ npx --no-install capability-mcp --describe-config
 
 file 默认开启 visualInputAvailable。生成并 render 文件后，使用 visualIndex 获取页索引、visualRead 读取实际页面图片、visualReport 提交核对结论；MCP 返回 image 内容块，而不仅是截图路径。视觉核对与当前源版本关联，修改后必须重新 render/read/report。配置 visualInputAvailable=false 可对不支持图像的客户端禁用；禁用不代表已经完成视觉核对。
 
+## 图片、视频与语音生成
+
+默认 `media.listModels` 会列出内置 Codex 图片模型，`generateImage` 复用本机已登录账号，不需要另填 API Key。要求 Codex CLI >=0.142；Windows 优先检查 Codex 桌面应用自带程序，其次使用 PATH。可通过 `tools.media.codexPath` 或 `CAPABILITY_CODEX_PATH` 指定程序。设置 `codexImage=false` 可关闭内置模型。账号是否支持原生图片工具，需要实际生成验证。
+
+独立 MCP 不读取宿主 agent 的模型配置。要接入其他图片、视频或语音模型，设置 `tools.media.modelsFile` 指向项目内 JSON，结构为 `{models: [...], defaults: {...}}`，模型字段见 `docs/media/README.zh-CN.md`。每个模型可将 `apiKey` 改为 `apiKeyEnv`，引用 MCP 进程的环境变量；不要把密钥放进工具参数或提交到仓库。自定义模型排在内置模型之前，defaults 可指定默认模型配置 ID。
+
 ## 字段参考
 
 下表默认值在没有显式配置和对应环境变量时生效。computer.enabled 默认按平台和 endpoint 判断。路径相对于项目根目录；时间单位为毫秒。所有修改都按重新启动 MCP 后的行为说明。
@@ -204,11 +210,14 @@ codeSandbox：本地 JavaScript/Python 执行与产物保存。临时工作区�
 
 ### media
 
-默认实现本地媒体检查和视频抽帧；OCR/转写/生成需业务 Provider，不会自动接入模型。
+本地媒体检查、抽帧、视频合成和生成适配器；默认图片生成复用本机 Codex 登录。
 
 | 字段 | 类型 | 默认值 | 可选值/范围 | 说明 |
 | --- | --- | --- | --- | --- |
 | `tools.media.enabled` | boolean | `true` | — | 是否注册该工具；false 时不加载模块，不向 MCP 客户端暴露此工具。修改后重启 MCP。 |
+| `tools.media.codexImage` | boolean | `true` | — | 提供内置 Codex 图片模型，要求已登录的 Codex CLI >=0.142。不会读取或迁移登录凭据。 |
+| `tools.media.codexPath` | string | `""` | — | 图片生成使用的 Codex 程序；空字符串优先使用 Windows Codex 应用内置新版，再使用 PATH。支持 CAPABILITY_CODEX_PATH 环境变量。 |
+| `tools.media.modelsFile` | string | `""` | — | 可选图片/视频/语音模型 JSON 文件，路径相对于项目。格式为 {models: [...], defaults: {...}}，每个模型可用 apiKeyEnv 引用环境变量。 |
 | `tools.media.timeoutMs` | integer | `120000` | 1000–900000 | FFmpeg 处理超时（毫秒）；媒体头检查最长 15 秒。 对应 `AGENT_MEDIA_TIMEOUT_MS`。 |
 | `tools.media.maxFrames` | integer | `12` | 1–60 | 每次抽帧最多生成的帧数。 对应 `AGENT_MEDIA_MAX_FRAMES`。 |
 
