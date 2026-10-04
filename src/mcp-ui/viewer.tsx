@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App, applyDocumentTheme, applyHostStyleVariables, type McpUiHostContext } from '@modelcontextprotocol/ext-apps';
 import { ChartRenderer } from '../chart/react.tsx';
@@ -9,11 +9,34 @@ import './viewer.css';
 const config = (window as any).__CAPABILITY_UI__ || { mode: 'app' };
 const root = createRoot(document.getElementById('root')!);
 let current: any;
-const app = config.mode === 'app' ? new App({ name: 'Capability visualization', version: '1.0.0' }, {}) : undefined;
+const app = config.mode === 'app' ? new App({ name: 'Capability visualization', version: '1.0.0' }, {
+  availableDisplayModes: ['inline', 'fullscreen', 'pip'],
+}) : undefined;
+let hostContext: McpUiHostContext = {};
+const hostListeners = new Set<() => void>();
+const subscribeHost = (listener: () => void) => {
+  hostListeners.add(listener);
+  return () => { hostListeners.delete(listener); };
+};
+const getHostContext = () => hostContext;
 
 function hostStyles(ctx?: McpUiHostContext) {
+  if (!ctx) return;
+  // Notifications contain only changed fields; a theme update must not exit fullscreen.
+  hostContext = { ...hostContext, ...ctx };
   if (ctx?.theme) applyDocumentTheme(ctx.theme);
   if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+  const dimensions = hostContext.containerDimensions;
+  const fixedHeight = dimensions && 'height' in dimensions && dimensions.height > 0;
+  document.documentElement.dataset.capabilityLayout =
+    hostContext.displayMode === 'fullscreen' || hostContext.displayMode === 'pip' || fixedHeight ? 'fill' : 'content';
+  hostListeners.forEach(listener => listener());
+}
+
+async function changeFullscreen(fullscreen: boolean) {
+  if (!app) return;
+  const result = await app.requestDisplayMode({ mode: fullscreen ? 'fullscreen' : 'inline' });
+  hostStyles({ displayMode: result.mode });
 }
 
 async function downloadFile(data: Blob | string, filename: string) {
@@ -95,10 +118,13 @@ function MapFallback({view}: {view:any}) {
 
 function Viewer({initial}: {initial:any}) {
   const [view,setView] = useState(initial);
+  const host = useSyncExternalStore(subscribeHost, getHostContext);
   return <main className="capability-viewer">
     <Boundary key={view.id}>
       {view.kind === 'chart' ? <ChartRenderer chart={view.record} excalidraw={{assetPath:app ? undefined : view.assetPath,langCode:'zh-CN'}}
         onDownload={app ? downloadFile : undefined}
+        fullscreen={app ? host.displayMode === 'fullscreen' : undefined}
+        onFullscreenChange={app ? changeFullscreen : undefined}
         onReload={async()=>{const next=await request('read');setView(next);return next.record;}}
         onSave={config.readOnly ? undefined : async(next,expectedRevision)=>{const value=await request('update',{option:next.option,expectedRevision});setView(value);return value.record;}} />
         : view.map?.browserKey ? <GoogleMapRenderer title={view.record.title} load={async()=>view.map}/>

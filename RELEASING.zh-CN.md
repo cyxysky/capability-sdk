@@ -1,14 +1,14 @@
 # 独立仓库与发布
 
-独立仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，对外名称 **Capability SDK**，npm 包名沿用 `@cjfclonedeep/capability-sdk`。当前独立版本 **0.3.6** 包含统一安装器、最新工具实现与修复。
+独立仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，对外名称 **Capability SDK**，npm 包名沿用 `@cjfclonedeep/capability-sdk`。当前独立版本 **0.3.7** 包含统一安装器、最新工具实现与修复。
 
 ## 从当前主项目导出
 
 在主项目根目录运行：
 
 ```sh
-node packages/capability-sdk/scripts/export-repository.mjs --output ../capability-sdk --version 0.3.6 --dry-run
-node packages/capability-sdk/scripts/export-repository.mjs --output ../capability-sdk --version 0.3.6
+node packages/capability-sdk/scripts/export-repository.mjs --output ../capability-sdk --version 0.3.7 --dry-run
+node packages/capability-sdk/scripts/export-repository.mjs --output ../capability-sdk --version 0.3.7
 ```
 
 只复制 SDK 的源码、运行脚本、文档、示例和仓库配置；不复制原 Agent 应用、生成的 dist、数据库、下载的运行环境、用户配置或原项目 Git 历史。当前未提交的 SDK 修改也会包含。目标必须为空，已有目录不会覆盖或清理。

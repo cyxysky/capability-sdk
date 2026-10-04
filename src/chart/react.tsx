@@ -21,6 +21,9 @@ export type ChartRendererProps = {
   onSave?(next: ChartRecord, expectedRevision: number): Promise<ChartRecord>;
   onReload?(): Promise<ChartRecord>;
   onDownload?: ChartDownload;
+  /** Supply both props when a host controls the card's fullscreen container. */
+  fullscreen?: boolean;
+  onFullscreenChange?(fullscreen: boolean): Promise<void>;
 };
 
 export function ChartRenderer(props: ChartRendererProps) {
@@ -29,7 +32,7 @@ export function ChartRenderer(props: ChartRendererProps) {
     : <DataChartRenderer {...props} />;
 }
 
-function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownload, translate: t = defaultChartTranslate }: ChartRendererProps) {
+function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownload, fullscreen: hostFullscreen, onFullscreenChange, translate: t = defaultChartTranslate }: ChartRendererProps) {
   const download = (data: Blob | string, name: string) => downloadChartFile(data, name, onDownload);
   const editableChart = useMemo(() => {
     if (chart.engine === 'three') return chart;
@@ -49,7 +52,8 @@ function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownloa
   const [ready, setReady] = useState(false);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [fullscreen, setFullscreen] = useState(false);
+  const [nativeFullscreen, setFullscreen] = useState(false);
+  const fullscreen = hostFullscreen ?? nativeFullscreen;
   const [threeView, setThreeView] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const converted = useMemo(() => current.engine === 'three' ? undefined : echartsToThree(current.option, t), [current, t]);
@@ -155,7 +159,7 @@ function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownloa
   }
   function action(task: () => Promise<void> | void) { void Promise.resolve().then(task).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason))); }
   const filename = (current.title || current.chartId).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 100);
-  return <figure ref={rootRef} className={`${classNames.root || 'capability-chart'} capability-chart-interactive${error ? ` ${classNames.error || 'has-error'}` : ''}`} aria-label={current.description || current.title || current.chartId} data-chart-id={current.chartId} data-chart-engine={isThree ? 'three' : 'echarts'}>
+  return <figure ref={rootRef} className={`${classNames.root || 'capability-chart'} capability-chart-interactive${error ? ` ${classNames.error || 'has-error'}` : ''}`} aria-label={current.description || current.title || current.chartId} data-chart-id={current.chartId} data-chart-engine={isThree ? 'three' : 'echarts'} data-fullscreen={fullscreen || undefined}>
     <style>{chartStyles}</style>
     <figcaption className="capability-chart-header">
       <strong className="capability-chart-title">{current.title || t('图表')}</strong>
@@ -171,7 +175,8 @@ function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownloa
         {dataTables.map((table, index) => <button type="button" key={table.id} aria-label={t('数据 CSV · {name}', { name: table.label })} onClick={() => action(() => download(new Blob([tableCsv(table, t)], { type: 'text/csv;charset=utf-8' }), `${filename}-data-${index + 1}.csv`))}><ChartIcon name="grid" /><span>{table.label}</span><small>CSV</small></button>)}
       </div></details>
       <button type="button" className="capability-chart-icon-button" aria-label={t(fullscreen ? '退出全屏' : '全屏')} title={t(fullscreen ? '退出全屏' : '全屏')} onClick={() => action(async () => {
-        if (document.fullscreenElement === rootRef.current) await document.exitFullscreen();
+        if (onFullscreenChange) await onFullscreenChange(!fullscreen);
+        else if (document.fullscreenElement === rootRef.current) await document.exitFullscreen();
         else if (rootRef.current?.requestFullscreen) await rootRef.current.requestFullscreen();
         else throw new Error('当前浏览器不支持全屏 API。');
       })}><ChartIcon name={fullscreen ? 'collapse' : 'expand'} /></button>

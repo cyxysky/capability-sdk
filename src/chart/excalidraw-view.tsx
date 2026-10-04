@@ -10,7 +10,7 @@ import { defaultChartTranslate } from './i18n.ts';
 import { ChartIcon } from './icons.tsx';
 import { downloadChartFile } from './download.ts';
 
-export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDownload, translate: t = defaultChartTranslate, excalidraw }: ChartRendererProps) {
+export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDownload, fullscreen: hostFullscreen, onFullscreenChange, translate: t = defaultChartTranslate, excalidraw }: ChartRendererProps) {
   const download = (data: Blob | string, name: string) => downloadChartFile(data, name, onDownload);
   const [current, setCurrent] = useState(chart);
   const [editing, setEditing] = useState(false);
@@ -18,7 +18,8 @@ export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDow
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [generation, setGeneration] = useState(0);
-  const [fullscreen, setFullscreen] = useState(false);
+  const [nativeFullscreen, setFullscreen] = useState(false);
+  const fullscreen = hostFullscreen ?? nativeFullscreen;
   const api = useRef<ExcalidrawImperativeAPI | null>(null);
   const root = useRef<HTMLElement | null>(null);
   const downloadMenu = useRef<HTMLDetailsElement | null>(null);
@@ -63,12 +64,12 @@ export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDow
       setNotice(onSave ? '' : t('已在当前页面应用；请导出文件保存。'));
     } finally { setSaving(false); }
   }
-  return <figure ref={root} className={`capability-excalidraw ${classNames.root || ''}`} data-chart-id={current.chartId} data-chart-engine="excalidraw" aria-label={current.description || current.title || current.chartId}>
+  return <figure ref={root} className={`capability-excalidraw ${classNames.root || ''}`} data-chart-id={current.chartId} data-chart-engine="excalidraw" data-fullscreen={fullscreen || undefined} aria-label={current.description || current.title || current.chartId}>
     <style>{`
       .capability-excalidraw.capability-excalidraw{--canvas-accent:var(--accent,#48654e);--canvas-muted:var(--muted,#7b8378);--canvas-line:color-mix(in srgb,var(--border,#dfe3d9) 75%,transparent);--canvas-tint:color-mix(in srgb,var(--canvas-accent) 7%,var(--panel,#fdfcf9));display:block;min-width:0;margin:16px 0;padding:0;overflow:hidden;border:1px solid var(--canvas-line);border-radius:18px;background:var(--panel,#fdfcf9);color:var(--foreground,#30392f);box-shadow:0 2px 4px #25302003,0 12px 32px -16px #25302018}
-      .capability-excalidraw.capability-excalidraw:fullscreen{display:flex;flex-direction:column;height:100%;width:100%;max-width:none;margin:0;border:0;border-radius:0;box-shadow:none}
-      .capability-excalidraw:fullscreen>.capability-excalidraw-canvas{flex:1;height:auto!important}
-      .capability-excalidraw-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:15px 18px;border-bottom:1px solid var(--canvas-line)}
+      .capability-excalidraw.capability-excalidraw:is(:fullscreen,[data-fullscreen=true]){box-sizing:border-box;display:flex;flex-direction:column;height:100%;min-height:0;width:100%;max-width:none;margin:0;border:0;border-radius:0;box-shadow:none}
+      .capability-excalidraw:is(:fullscreen,[data-fullscreen=true])>.capability-excalidraw-canvas{flex:1 1 0;height:auto!important;min-height:0}
+      .capability-excalidraw-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;flex-shrink:0;padding:15px 18px;border-bottom:1px solid var(--canvas-line)}
       .capability-excalidraw-heading{display:flex;align-items:center;gap:11px;flex:1;min-width:160px}
       .capability-excalidraw-emblem{display:grid;place-items:center;flex:none;width:36px;height:36px;border:1px solid color-mix(in srgb,var(--canvas-accent) 12%,transparent);border-radius:11px;background:var(--canvas-tint);color:var(--canvas-accent)}
       .capability-excalidraw-heading-copy{display:grid;gap:3px;min-width:0}
@@ -90,7 +91,7 @@ export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDow
       .capability-excalidraw-download-menu{position:absolute;top:calc(100% + 10px);right:0;display:grid;gap:2px;width:196px;max-width:calc(100vw - 48px);padding:6px;background:var(--panel,#fff);border:1px solid var(--canvas-line);border-radius:12px;box-shadow:0 12px 36px #25302014,0 2px 6px #25302008}
       .capability-excalidraw-download-menu button{justify-content:flex-start;width:100%;height:38px;padding:0 10px;gap:10px;color:var(--foreground,#30392f);font-weight:400}
       .capability-excalidraw-download-menu button:hover:not(:disabled){background:var(--canvas-tint);box-shadow:none}
-      .capability-excalidraw-message{padding:10px 18px;margin:0;border-top:1px solid var(--canvas-line);font-size:12px;line-height:1.6;color:var(--canvas-muted)}
+      .capability-excalidraw-message{padding:10px 18px;margin:0;border-top:1px solid var(--canvas-line);font-size:12px;line-height:1.6;color:var(--canvas-muted);flex-shrink:0}
       .capability-excalidraw-message[role=alert]{color:var(--danger,#b42318)}
       .capability-excalidraw-canvas{position:relative;min-height:240px;container-type:inline-size}
       .capability-excalidraw .excalidraw{--color-primary:var(--canvas-accent);--color-primary-darker:var(--canvas-accent);--color-primary-darkest:var(--foreground,#30392f);--color-primary-light:var(--canvas-tint);--color-primary-light-darker:color-mix(in srgb,var(--canvas-accent) 15%,var(--panel,#fff));--color-surface-primary-container:var(--canvas-tint);--color-surface-low:var(--panel-soft,#f4f5f0);--color-surface-mid:var(--canvas-tint);--button-hover-bg:var(--canvas-tint);--button-active-bg:var(--canvas-tint);--island-bg-color:var(--panel,#fdfcf9);--default-border-color:var(--canvas-line);--border-radius-lg:10px}
@@ -130,7 +131,8 @@ export function ExcalidrawView({ chart, classNames = {}, onSave, onReload, onDow
       <button type="button" onClick={() => act(async () => download(new Blob([(await exportToSvg(snapshot())).outerHTML], { type: 'image/svg+xml' }), `${name}.svg`))}><ChartIcon name="image" />SVG</button>
       </div></details>
       <button type="button" title={fullscreen ? t('退出全屏') : t('全屏')} aria-label={fullscreen ? t('退出全屏') : t('全屏')} onClick={() => act(async () => {
-        if (document.fullscreenElement === root.current) await document.exitFullscreen();
+        if (onFullscreenChange) await onFullscreenChange(!fullscreen);
+        else if (document.fullscreenElement === root.current) await document.exitFullscreen();
         else await root.current?.requestFullscreen();
       })}><ChartIcon name={fullscreen ? 'collapse' : 'expand'} /></button>
       </div>
