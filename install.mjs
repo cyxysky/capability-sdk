@@ -100,13 +100,13 @@ async function main() {
       packageSource = temporaryPackage;
     }
     await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [npm, ...argsFor(packageSource)], {
-      cwd: process.cwd(), stdio: 'inherit', windowsHide: true, shell: false,
-      // npm exec's cache is not the final project. setup installs runtimes only after config preflight.
-      env: { ...process.env, CAPABILITY_SKIP_RUNTIME_INSTALL: '1' },
-    });
-    child.once('error', reject);
-    child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Installation exited with ${code}. You can rerun this installer; existing MCP connections are backed up and merged.`)));
+      const child = spawn(process.execPath, [npm, ...argsFor(packageSource)], {
+        cwd: process.cwd(), stdio: 'inherit', windowsHide: true, shell: false,
+        // npm exec's cache is not the final project. setup installs runtimes only after config preflight.
+        env: { ...process.env, CAPABILITY_SKIP_RUNTIME_INSTALL: '1' },
+      });
+      child.once('error', reject);
+      child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Installation exited with ${code}. You can rerun this installer; existing MCP connections are backed up and merged.`)));
     });
   } finally {
     if (temporaryPackage) await unlink(temporaryPackage).catch(error => { if (error.code !== 'ENOENT') throw error; });
