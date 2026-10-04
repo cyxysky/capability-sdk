@@ -1,0 +1,8 @@
+{
+  "package": "@cjfclonedeep/capability-sdk",
+  "version": "0.3.1",
+  "files": 422,
+  "builtArtifactsIncluded": false,
+  "source": "Current SDK working tree, including local changes",
+  "license": "MIT"
+}
