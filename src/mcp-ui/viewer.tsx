@@ -23,21 +23,21 @@ async function downloadFile(data: Blob | string, filename: string) {
     if (!match) throw new Error('无法读取导出图片。');
     return new Blob([Uint8Array.from(atob(match[2]), c => c.charCodeAt(0))], {type:match[1]});
   })() : data;
-  if (!app.getHostCapabilities()?.downloadFile) {
-    if (!current.previewUrl) throw new Error('当前宿主不支持下载；请启用浏览器预览后导出。');
-    const response = await fetch(`${current.previewUrl}/exports?filename=${encodeURIComponent(filename)}`, {
-      method:'POST',headers:{'content-type':file.type},body:file,
-    });
-    const value = await response.json();
-    if (!response.ok) throw new Error(value.error || '导出失败。');
-    const result = await app.openLink({url:value.url});
-    if (result.isError) throw new Error('宿主未打开下载链接；请在浏览器预览中导出。');
-    return;
-  }
   const encoded = await new Promise<string>((resolve,reject) => {
     const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]);
     reader.onerror = () => reject(reader.error); reader.readAsDataURL(file);
   });
+  if (!app.getHostCapabilities()?.downloadFile) {
+    if (!current.previewUrl || !current.exportToolName) throw new Error('当前宿主不支持下载；请启用浏览器预览后导出。');
+    const prepared = await app.callServerTool({name:current.exportToolName,arguments:{
+      token:current.token,filename,mimeType:file.type.split(';')[0],base64:encoded,
+    }});
+    const url = (prepared.structuredContent as any)?.url;
+    if (prepared.isError || !url) throw new Error(prepared.content?.filter(c=>c.type==='text').map(c=>(c as any).text).join('\n') || '导出失败。');
+    const result = await app.openLink({url});
+    if (result.isError) throw new Error('宿主未打开下载链接；请在浏览器预览中导出。');
+    return;
+  }
   const result = await app.downloadFile({contents:[{type:'resource',resource:{
     uri:`file:///${encodeURIComponent(filename)}`,mimeType:file.type || 'application/octet-stream',blob:encoded,
   }}]});

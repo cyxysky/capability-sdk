@@ -6,7 +6,7 @@
 
 工具实现、输入参数、使用说明、结构化结果和本地运行环境一起交付。支持 MCP 的客户端可以直接连接；自有 Agent 可以选择需要的工具，在进程内调用。继续使用你已有的模型和任务编排。
 
-当前独立版本为 **0.3.4**，通过 [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.4) 分发。安装器可直接使用 GitHub 包，npm 发布是可选的。npm 0.3.0 没有统一安装器。
+当前独立版本为 **0.3.5**，通过 [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.5) 分发。安装器可直接使用 GitHub 包，npm 发布是可选的。npm 0.3.0 没有统一安装器。
 
 ## 能给 Agent 增加什么
 
@@ -39,7 +39,7 @@ irm https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.ps1 | 
 curl -fsSL https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.sh | sh
 ```
 
-脚本默认将 0.3.4 安装到 `~/.capability-tools`，准备运行环境，并为支持的客户端合并用户级 MCP 配置。npm 对应版本尚未发布时，自动下载 GitHub Release 包并验证 SHA-256。已有配置会备份；其他 MCP 服务会保留。完成后重新加载客户端，启用 `capability-sdk` 连接。
+脚本默认将 0.3.5 安装到 `~/.capability-tools`，准备运行环境，并为支持的客户端合并用户级 MCP 配置。npm 对应版本尚未发布时，自动下载 GitHub Release 包并验证 SHA-256。已有配置会备份；其他 MCP 服务会保留。完成后重新加载客户端，启用 `capability-sdk` 连接。
 
 首次完整安装会下载数 GB 运行环境，失败后重试可复用缓存；Linux 的系统依赖安装可能需要 root 或免密码 sudo。[完整安装说明](SETUP.zh-CN.md)列出了每个客户端的配置路径和作用域。
 
@@ -57,10 +57,10 @@ node install.mjs --clients cursor,codex,claude-code --project ./agent-tools
 在你的 Agent 项目中安装发布包：
 
 ```sh
-npm install https://github.com/cyxysky/capability-sdk/releases/download/v0.3.4/cjfclonedeep-capability-sdk-0.3.4.tgz
+npm install https://github.com/cyxysky/capability-sdk/releases/download/v0.3.5/cjfclonedeep-capability-sdk-0.3.5.tgz
 ```
 
-同版本发布到 npm 后，也可用 `npm install @cjfclonedeep/capability-sdk@0.3.4`。选择需要的工具，取出参数定义、说明与执行接口：
+同版本发布到 npm 后，也可用 `npm install @cjfclonedeep/capability-sdk@0.3.5`。选择需要的工具，取出参数定义、说明与执行接口：
 
 ```js
 import { createLocalCapabilities } from '@cjfclonedeep/capability-sdk/local';

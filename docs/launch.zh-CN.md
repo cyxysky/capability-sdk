@@ -1,6 +1,6 @@
 # 发布介绍与演示草稿
 
-以下材料供维护者审阅；尚未发到外部社区。仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，当前独立版本为 0.3.4。大规模传播前仍需在干净的 Windows 与受支持 Linux 上验证完整运行环境安装。
+以下材料供维护者审阅；尚未发到外部社区。仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，当前独立版本为 0.3.5。大规模传播前仍需在干净的 Windows 与受支持 Linux 上验证完整运行环境安装。
 
 ## 项目一句话
 
@@ -64,7 +64,7 @@ Requires Node.js >=22.16 with npm. Full runtime preparation downloads several GB
 
 ## 发布顺序
 
-1. 发布独立 GitHub 仓库、许可证和 0.3.4；验证 Windows 与受支持 Linux 的安装路径。
+1. 发布独立 GitHub 仓库、许可证和 0.3.5；验证 Windows 与受支持 Linux 的安装路径。
 2. README 首页放一句话用途、安装命令、三个演示和接入方式；详细 API 留在现有文档。
 3. 从现有主项目 README 链接到工具仓库，将主项目作为工具使用示例。
 4. 先向使用 MCP、浏览器自动化和 Office 工具的开发者分享实际演示，收集安装与接入问题，再扩大发布范围。

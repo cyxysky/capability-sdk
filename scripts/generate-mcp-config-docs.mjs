@@ -57,7 +57,7 @@ npx --no-install capability-mcp --describe-config
 
 ## 浏览器工具调用
 
-默认 Windows 注册 8 个工具：browser、terminal、codeSandbox、file、chart、knowledge、media、computer。Linux 未配置桌面驱动时为 7 个；禁用组会减少数量，lazy Skill 模式会增加 skill。
+默认 Windows 注册 8 个业务工具：browser、terminal、codeSandbox、file、chart、knowledge、media、computer。Linux 未配置桌面驱动时为 7 个；禁用组会减少数量，lazy Skill 模式会增加 skill。启用可视化时还注册一个标记为 visibility=app 的导出辅助工具，供内嵌界面使用；支持 MCP Apps 的客户端应将它隐藏于模型工具列表。
 
 浏览器现在只有一个 \`browser\` 工具。旧 browser_open/browser_code/browser_snapshot/browser_close 已移除，需要刷新 MCP 工具列表。参数按 action 严格校验：
 
