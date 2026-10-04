@@ -87,4 +87,6 @@ node install.mjs --clients cursor,codex --name capability-work
 
 首次运行会下载数 GB 环境；失败后重试可复用缓存。Linux 系统依赖需要 root 或免密码 sudo。安装完成后重启/重载客户端，并按客户端提示启用或信任 MCP；脚本不替应用确认授权。
 
+模型默认使用可续传的 HTTP 下载，避免部分代理环境下 Xet 传输停滞。如需主动启用 Xet，可设置 `HF_HUB_DISABLE_XET=0`。
+
 API Key、数据库、企业通信及自定义媒体 Provider 仍需自行配置。地图默认不启用，敏感数据模型也不会自动拦截客户端的模型请求。这里的“全部工具”指包内可自动准备的本地能力和运行环境，完整边界见 [运行环境](RUNTIME.zh-CN.md) 与 [工具配置](MCP-CONFIG.zh-CN.md)。

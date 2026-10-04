@@ -8,7 +8,7 @@ From a reviewed standalone SDK clone, run `install.cmd` on Windows, or:
 node install.mjs --clients cursor,codex,claude-code
 ```
 
-The standalone launcher installs the pinned prepared release into `~/.capability-tools` by default; it requires npm 0.3.1 or later. It installs/repairs managed runtimes, creates missing tool configuration, and merges user-level MCP configuration for Cursor, Codex, Claude Code, Claude Desktop, VS Code, legacy Windsurf, and Devin. It does not install those applications or run Orbit, dev, or build. Source without `dist` requires a prepared SDK release. In the original Orbit workspace, `install-mcp.cmd` / `npm run mcp:setup` still reuse its prepared SDK.
+The standalone launcher installs the pinned prepared release into `~/.capability-tools` by default; it requires an SDK release with unified setup (0.3.1 or later), available from npm or GitHub Releases. It installs/repairs managed runtimes, creates missing tool configuration, and merges user-level MCP configuration for Cursor, Codex, Claude Code, Claude Desktop, VS Code, legacy Windsurf, and Devin. It does not install those applications or run Orbit, dev, or build. Source without `dist` requires a prepared SDK release. In the original Orbit workspace, `install-mcp.cmd` / `npm run mcp:setup` still reuse its prepared SDK.
 
 To install a prepared SDK tarball into a separate tools directory:
 
@@ -34,3 +34,5 @@ npx --no-install capability-mcp init all --scope project
 `--dry-run` performs no downloads or writes. Before the SDK is available it prints the installation plan; full client-file validation runs once dependencies are available. Existing SDK configuration is preflighted before runtime downloads. Existing unrelated settings and JSONC/TOML comments are preserved, changed files receive adjacent backups, and identical registrations are not rewritten. Conflicting server names fail; use `--name another-name` or edit that entry explicitly. Inline TOML server maps that cannot be appended safely require manual conversion to table sections. Concurrent edits abort; files are saved individually, so a later filesystem failure can leave earlier files completed with backups.
 
 Node and tool runtimes are shared by client configurations; each client starts its own stdio server. Runtime downloads may take several GB. Linux OS packages may require root/passwordless sudo. API keys, databases, business providers and client-side approvals still need configuration. See [runtime details](RUNTIME.md) and [tool configuration](MCP-CONFIG.zh-CN.md).
+
+Model downloads use resumable HTTP by default to avoid Xet transport stalls behind some proxies. Set `HF_HUB_DISABLE_XET=0` explicitly to opt into Xet.
