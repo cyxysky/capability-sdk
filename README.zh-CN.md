@@ -6,7 +6,7 @@
 
 工具实现、输入参数、使用说明、结构化结果和本地运行环境一起交付。支持 MCP 的客户端可以直接连接；自有 Agent 可以选择需要的工具，在进程内调用。继续使用你已有的模型和任务编排。
 
-> **发布准备中：**独立项目的首个版本暂定 **0.3.1**。下面的远程安装命令需要 GitHub 仓库和 npm 新版本发布后才能使用。npm 0.3.0 没有统一安装器。
+首个独立版本为 **0.3.1**，通过 [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.1) 分发。安装器可直接使用 GitHub 包，npm 发布是可选的。npm 0.3.0 没有统一安装器。
 
 ## 能给 Agent 增加什么
 
@@ -27,13 +27,13 @@
 
 需要 **Node.js >=22.16 和 npm**。自动准备运行环境支持 Windows x64，以及 Ubuntu 22.04/24.04、Debian 12/13 的 x64/arm64。macOS 暂不支持自动准备运行环境。
 
-发布后，在 Windows PowerShell 运行：
+在 Windows PowerShell 运行：
 
 ```powershell
 irm https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.ps1 | iex
 ```
 
-发布后，在受支持的 Linux 系统运行：
+在受支持的 Linux 系统运行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.sh | sh

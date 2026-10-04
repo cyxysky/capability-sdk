@@ -1,6 +1,6 @@
 # 独立仓库与发布
 
-仓库暂定 `cyxysky/capability-sdk`，对外名称 **Capability SDK**，npm 包名沿用 `@cjfclonedeep/capability-sdk`。新版本暂定 **0.3.1**，包含统一安装器、最新工具实现与修复。
+独立仓库为 [cyxysky/capability-sdk](https://github.com/cyxysky/capability-sdk)，对外名称 **Capability SDK**，npm 包名沿用 `@cjfclonedeep/capability-sdk`。首个独立版本 **0.3.1** 包含统一安装器、最新工具实现与修复。
 
 ## 从当前主项目导出
 
@@ -20,7 +20,7 @@ node packages/capability-sdk/scripts/export-repository.mjs --output ../capabilit
 - 维护者已选择 MIT，`LICENSE` 与 package.json 的 `license` 已添加；第三方组件分别遵循自己的许可。
 - GitHub 仓库名称、公开范围与 npm 包维护权限。
 - 对新增行为选择正确版本号；npm 已发布的 0.3.0 不能被覆盖。
-- 首次在独立目录安装开发依赖并检查类型；以后提交独立 `package-lock.json`，将 CI 的安装命令改为 `npm ci`。
+- 独立仓库已提交 `package-lock.json`。修改依赖后更新锁文件；CI 使用 `npm ci` 固定依赖解析。
 
 源码不再继承原应用的 tsconfig，Node、React、Three.js 等开发类型依赖也已显式列出。CI 只做类型检查和安装计划预览，不下载完整工具运行环境。
 
@@ -42,7 +42,7 @@ Windows 将路径换为实际目录。必须验证 MCP 初始化、浏览器读�
 
 需要同时发布 npm 时，手动运行相同工作流，选择 `publish=true`。它会校验许可证、发布 npm 包、创建同版本 GitHub Release 并上传 `.tgz` 与校验和。许可证或导出文件缺失时停止。已存在的 GitHub Release 不会被静默覆盖；后续修复先提高版本号。GitHub 托管 runner 使用 Node 24，满足 OIDC 对 npm/Node 的要求。
 
-GitHub Release 发布成功后，删除 README 中“发布准备中”的说明，再开始传播安装命令。npm 登录或可信发布配置未就绪时，可先使用 GitHub 分发路径。将视频、输入样例与实际产物放进 Release，方便用户直接复现。
+确认 GitHub Release 的安装包与校验和可以下载后，再传播安装命令。npm 登录或可信发布配置未就绪时，可先使用 GitHub 分发路径。将视频、输入样例与实际产物放进 Release，方便用户直接复现。
 
 ## 依赖与第三方运行环境
 

@@ -6,7 +6,7 @@
 
 Capability SDK packages tool implementations, input schemas, operating instructions, structured results and local runtime preparation together. Connect a supported MCP client, or mount selected capabilities in your own agent process. Your agent keeps its model and orchestration.
 
-> **Release preparation:** the standalone release is planned as **0.3.1**. The one-command installers below become available after the GitHub repository and npm release are published. npm 0.3.0 does not contain the unified setup command.
+The first standalone release is **0.3.1**, distributed through [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.1). The installer supports GitHub packages directly; npm publication is optional. npm 0.3.0 does not contain the unified setup command.
 
 ## What your agent can do
 
@@ -27,13 +27,13 @@ Use [tool configuration](MCP-CONFIG.zh-CN.md) to select what you expose. Sensiti
 
 Requires **Node.js >=22.16 with npm**. Automatic runtime preparation supports Windows x64 and Ubuntu 22.04/24.04 or Debian 12/13 on x64/arm64. macOS automatic runtime preparation is not currently supported.
 
-Windows PowerShell, after publication:
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.ps1 | iex
 ```
 
-Supported Linux systems, after publication:
+Supported Linux systems:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.sh | sh

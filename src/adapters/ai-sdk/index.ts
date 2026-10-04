@@ -1,4 +1,4 @@
-import { jsonSchema, tool, type ToolExecutionOptions, type ToolSet } from 'ai';
+import { jsonSchema, tool, type Tool, type ToolExecutionOptions, type ToolSet } from 'ai';
 import {
   mountCapabilities,
   type CapabilitySkillInstructionMode,
@@ -172,7 +172,7 @@ export type MountedAISDKCapabilities = Omit<MountedCapabilities, 'tools'> & {
 export function createAISDKResponseTool(session: ResponseSession, options: {
   description?: string;
   onAccept?: (response: StructuredResponse, execution: ToolExecutionOptions<unknown>) => Promise<unknown>;
-} = {}) {
+} = {}): Tool<StructuredResponse, unknown> {
   const input = session.registry.input();
   return tool({
     description: [options.description || 'Deliver the final ordered response. Do not call other tools after this.',

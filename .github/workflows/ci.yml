@@ -19,6 +19,6 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '22.16.0'
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: node install.mjs --dry-run --clients cursor --project ./example-tools

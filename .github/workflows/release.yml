@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - name: Prepare the distributable on the release runner
         run: npm pack
