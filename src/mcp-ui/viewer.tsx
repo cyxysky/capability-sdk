@@ -95,22 +95,14 @@ function MapFallback({view}: {view:any}) {
 
 function Viewer({initial}: {initial:any}) {
   const [view,setView] = useState(initial);
-  const [error,setError] = useState('');
-  async function refresh(){try{setView(await request('read'));setError('');}catch(e){setError(String(e));}}
   return <main className="capability-viewer">
-    <nav className="capability-viewer-toolbar"><strong>{view.kind === 'chart' ? '图表' : '地图'}</strong><span/>
-      <button onClick={refresh}>刷新</button>
-      {app && view.previewUrl && <button onClick={()=>app.openLink({url:view.previewUrl}).catch(e=>setError(String(e)))}>在浏览器中打开</button>}
-    </nav>
-    {error && <p role="alert">{error}</p>}
     <Boundary key={view.id}>
-      {view.kind === 'chart' ? <ChartRenderer chart={view.record} excalidraw={{assetPath:view.assetPath,langCode:'zh-CN'}}
+      {view.kind === 'chart' ? <ChartRenderer chart={view.record} excalidraw={{assetPath:app ? undefined : view.assetPath,langCode:'zh-CN'}}
         onDownload={app ? downloadFile : undefined}
         onReload={async()=>{const next=await request('read');setView(next);return next.record;}}
         onSave={config.readOnly ? undefined : async(next,expectedRevision)=>{const value=await request('update',{option:next.option,expectedRevision});setView(value);return value.record;}} />
         : view.map?.browserKey ? <GoogleMapRenderer title={view.record.title} load={async()=>view.map}/>
         : <MapFallback view={view}/>}</Boundary>
-    <footer className="capability-viewer-footer">{view.kind === 'chart' ? config.readOnly ? '当前预览不写回服务器；页面内修改可通过导出保留。' : '修改后保存即可更新图表；其他会话可重新读取最新版本。' : '地图服务的网络与授权设置会影响底图显示。'}</footer>
   </main>;
 }
 

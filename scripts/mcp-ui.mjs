@@ -113,8 +113,8 @@ export async function createMcpVisualization({ tools, invoke, options = {} }) {
       server.registerResource('capability-visualization',uri,{mimeType:mime,description:'Interactive charts and maps'},async()=>({contents:[{
         uri,mimeType:mime,text:page({mode:'app',readOnly:options.readOnly===true}),
         _meta:{ui:{prefersBorder:true,csp:{
-          resourceDomains:['https://maps.googleapis.com','https://maps.gstatic.com','https://*.googleapis.com','https://*.gstatic.com','https://*.google.com','https://fonts.googleapis.com','https://fonts.gstatic.com',...(origin?[origin]:[])],
-          connectDomains:['https://*.googleapis.com','https://*.gstatic.com','https://*.google.com',...(origin?[origin]:[])],
+          resourceDomains:['https://esm.sh','https://maps.googleapis.com','https://maps.gstatic.com','https://*.googleapis.com','https://*.gstatic.com','https://*.google.com','https://fonts.googleapis.com','https://fonts.gstatic.com',...(origin?[origin]:[])],
+          connectDomains:['https://esm.sh','https://*.googleapis.com','https://*.gstatic.com','https://*.google.com',...(origin?[origin]:[])],
         }}}},]}));
     },
     async decorate(name,result) {
