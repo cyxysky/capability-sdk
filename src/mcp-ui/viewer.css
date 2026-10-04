@@ -4,7 +4,7 @@ body{margin:0;background:var(--color-background-primary,#fff);color:var(--color-
 .capability-viewer>[role=alert]{color:#b42318;padding:12px;overflow-wrap:anywhere}
 /* A host-expanded iframe is distinct from the browser's :fullscreen element. */
 html[data-capability-layout=fill],html[data-capability-layout=fill] body,html[data-capability-layout=fill] #root{height:100%;min-height:0}
-html[data-capability-layout=fill] body{height:100dvh;overflow:hidden}
+html[data-capability-layout=fill] body{height:var(--capability-host-height,100dvh);overflow:hidden}
 html[data-capability-layout=fill] .capability-viewer{height:100%;min-height:0}
 html[data-capability-layout=fill] .capability-viewer>:is(.capability-chart-interactive,.capability-excalidraw,.capability-google-map,.map-fallback){box-sizing:border-box;display:flex;flex-direction:column;height:100%;min-height:0;border:0;border-radius:0;box-shadow:none}
 html[data-capability-layout=fill] .capability-chart-viewport,html[data-capability-layout=fill] .capability-excalidraw-canvas{height:auto!important;flex:1 1 0;min-height:0}

@@ -28,6 +28,10 @@ function hostStyles(ctx?: McpUiHostContext) {
   if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
   const dimensions = hostContext.containerDimensions;
   const fixedHeight = dimensions && 'height' in dimensions && dimensions.height > 0;
+  // The host can announce its target height before resizing the iframe. Using
+  // that height also lets autoResize report the expanded size back to the host.
+  if (fixedHeight) document.documentElement.style.setProperty('--capability-host-height', `${dimensions.height}px`);
+  else document.documentElement.style.removeProperty('--capability-host-height');
   document.documentElement.dataset.capabilityLayout =
     hostContext.displayMode === 'fullscreen' || hostContext.displayMode === 'pip' || fixedHeight ? 'fill' : 'content';
   hostListeners.forEach(listener => listener());

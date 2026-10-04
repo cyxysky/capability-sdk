@@ -6,7 +6,7 @@
 
 Capability SDK packages tool implementations, input schemas, operating instructions, structured results and local runtime preparation together. Connect a supported MCP client, or mount selected capabilities in your own agent process. Your agent keeps its model and orchestration.
 
-The current standalone release is **0.3.8**, distributed through [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.8). The installer supports GitHub packages directly; npm publication is optional. npm 0.3.0 does not contain the unified setup command.
+The current standalone release is **0.3.9**, distributed through [GitHub Releases](https://github.com/cyxysky/capability-sdk/releases/tag/v0.3.9). The installer supports GitHub packages directly; npm publication is optional. npm 0.3.0 does not contain the unified setup command.
 
 ## What your agent can do
 
@@ -39,7 +39,7 @@ Supported Linux systems:
 curl -fsSL https://raw.githubusercontent.com/cyxysky/capability-sdk/main/install.sh | sh
 ```
 
-These scripts install release 0.3.8 into `~/.capability-tools`, prepare runtimes and merge supported user-level MCP configurations with backups. When the npm version is unavailable, they download the matching GitHub Release package and verify its SHA-256 checksum. Reload your client and enable the `capability-sdk` connection. The first full runtime preparation can download several GB; Linux system dependencies may need root or passwordless sudo. See [setup details](SETUP.md).
+These scripts install release 0.3.9 into `~/.capability-tools`, prepare runtimes and merge supported user-level MCP configurations with backups. When the npm version is unavailable, they download the matching GitHub Release package and verify its SHA-256 checksum. Reload your client and enable the `capability-sdk` connection. The first full runtime preparation can download several GB; Linux system dependencies may need root or passwordless sudo. See [setup details](SETUP.md).
 
 For a reviewed local clone, preview or select clients:
 
@@ -55,10 +55,10 @@ Supported configuration targets: Cursor, Codex, Claude Code, Claude Desktop, VS 
 Install the prepared release in your agent project:
 
 ```sh
-npm install https://github.com/cyxysky/capability-sdk/releases/download/v0.3.8/cjfclonedeep-capability-sdk-0.3.8.tgz
+npm install https://github.com/cyxysky/capability-sdk/releases/download/v0.3.9/cjfclonedeep-capability-sdk-0.3.9.tgz
 ```
 
-Once the same version is available on npm, `npm install @cjfclonedeep/capability-sdk@0.3.8` is equivalent. Mount only the capabilities you need, then give their schemas, instructions and execution functions to your model adapter:
+Once the same version is available on npm, `npm install @cjfclonedeep/capability-sdk@0.3.9` is equivalent. Mount only the capabilities you need, then give their schemas, instructions and execution functions to your model adapter:
 
 ```js
 import { createLocalCapabilities } from '@cjfclonedeep/capability-sdk/local';
