@@ -23,7 +23,12 @@ const getHostContext = () => hostContext;
 function hostStyles(ctx?: McpUiHostContext) {
   if (!ctx) return;
   // Notifications contain only changed fields; a theme update must not exit fullscreen.
-  hostContext = { ...hostContext, ...ctx };
+  const modeChanged = ctx.displayMode !== undefined && ctx.displayMode !== hostContext.displayMode;
+  hostContext = { ...hostContext, ...ctx,
+    // A previous mode's fixed height cannot constrain the new mode. Hosts that
+    // send only displayMode use the iframe viewport until new dimensions arrive.
+    ...(modeChanged && !ctx.containerDimensions ? { containerDimensions: undefined } : {}),
+  };
   if (ctx?.theme) applyDocumentTheme(ctx.theme);
   if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
   const dimensions = hostContext.containerDimensions;

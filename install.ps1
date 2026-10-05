@@ -1,7 +1,7 @@
 param(
   [string]$ProjectDirectory,
   [string]$Clients = 'all',
-  [string]$Version = '0.3.9',
+  [string]$Version = '0.3.10',
   [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
