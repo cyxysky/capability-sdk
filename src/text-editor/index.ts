@@ -1,6 +1,9 @@
+import { getErrorCode } from "../errors.ts";
 import { z } from 'zod';
 import { defineCapabilityInput, defineCapabilityTool, type CapabilityExecutionContext, type CapabilityManifest, type CapabilityProvider, type CapabilityRunContext } from '../index.ts';
 import { textEditorRuntimeSkill } from './runtime-skill.ts';
+import { ERROR_CODES } from '../errors.ts';
+
 
 export const textFormatSchema = z.enum(['text', 'markdown', 'html']);
 export type TextFormat = z.infer<typeof textFormatSchema>;
@@ -45,7 +48,7 @@ export function createTextEditorCapability(options: { createOperations(context: 
       ], policy: { concurrency: 'serial', concurrencyGroup: 'text-editor', permissions: textEditorCapabilityManifest.permissions },
       async execute(input, execution) {
         try { execution.abortSignal?.throwIfAborted(); return { ok: true, summary: `Text document ${input.action} completed.`, data: await operations.execute(input, execution) }; }
-        catch (error) { return { ok: false, error: { code: 'text-editor-operation-failed', message: error instanceof Error ? error.message : String(error), retryable: false } }; }
+        catch (error) { return { ok: false, error: { code: getErrorCode(error, ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED), message: error instanceof Error ? error.message : String(error), retryable: false } }; }
       },
     });
     return { tools: { textEditor: tool }, health: async () => ({ status: 'healthy' as const }), dispose: () => operations.dispose?.() || Promise.resolve() };

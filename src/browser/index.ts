@@ -12,6 +12,8 @@ import {
 } from '../index.ts';
 import { browserCapabilitySettings } from './settings.ts';
 import { browserRuntimeSkill, browserRuntimeReferenceSkills, browserInteractiveQaSkill } from './runtime-skill.ts';
+import { ERROR_CODES, normalizeErrorCode } from '../errors.ts';
+
 
 export * from './output-settings.ts';
 export * from './interaction-schema.ts';
@@ -144,7 +146,7 @@ export type BrowserOperationResult = {
   failureCategory?: string;
   referenceImagePath?: string;
   referenceImagePaths?: string[];
-  browserObservation?: { width?: number; height?: number; surfaceId?: string; visualHash?: string; id?: string; domEpoch?: number; actionable?: boolean; retention?: 'replace' | 'append' | 'keep-pair'; disabledReason?: 'automatic-screenshot-disabled' | 'model-image-input-unavailable'; status: 'available' | 'unavailable' | 'disabled'; path?: string; url?: string; capturedAt?: string; error?: string };
+  browserObservation?: { width?: number; height?: number; surfaceId?: string; visualHash?: string; id?: string; domEpoch?: number; actionable?: boolean; retention?: 'replace' | 'append' | 'keep-pair'; disabledReason?: typeof ERROR_CODES.AUTOMATIC_SCREENSHOT_DISABLED | typeof ERROR_CODES.MODEL_IMAGE_INPUT_UNAVAILABLE; status: 'available' | 'unavailable' | 'disabled'; path?: string; url?: string; capturedAt?: string; error?: string };
   [key: string]: unknown;
 };
 
@@ -171,7 +173,7 @@ export function browserOperationToCapabilityResult(
       ok: false,
       content,
       error: {
-        code: result.failureCategory || 'browser-operation-failed',
+        code: normalizeErrorCode(result.failureCategory, ERROR_CODES.BROWSER_OPERATION_FAILED),
         message: browserOperationSummary(result),
         details: envelope,
       },

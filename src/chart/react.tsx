@@ -10,6 +10,8 @@ import { ChartIcon } from './icons.tsx';
 import { defaultChartTranslate, type ChartTranslate } from './i18n.ts';
 import { ExcalidrawRenderer } from './excalidraw-react.tsx';
 import { downloadChartFile, type ChartDownload } from './download.ts';
+import { CodedError, ERROR_CODES } from '../errors.ts';
+
 export { exportChartPng } from './png.ts';
 
 export type ChartRendererClassNames = { root?: string; canvas?: string; surface?: string; error?: string };
@@ -178,7 +180,7 @@ function DataChartRenderer({ chart, classNames = {}, onSave, onReload, onDownloa
         if (onFullscreenChange) await onFullscreenChange(!fullscreen);
         else if (document.fullscreenElement === rootRef.current) await document.exitFullscreen();
         else if (rootRef.current?.requestFullscreen) await rootRef.current.requestFullscreen();
-        else throw new Error('当前浏览器不支持全屏 API。');
+        else throw new CodedError(ERROR_CODES.CHART_OPERATION_FAILED, '当前浏览器不支持全屏 API。');
       })}><ChartIcon name={fullscreen ? 'collapse' : 'expand'} /></button>
       </div>
     </figcaption>

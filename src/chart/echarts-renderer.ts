@@ -1,6 +1,8 @@
 import * as echarts from 'echarts';
 import { echartsMapDefinition, normalizeChartOption, type ChartRecord } from './core.ts';
 import type { ChartSurface } from './three-renderer.ts';
+import { CodedError, ERROR_CODES } from '../errors.ts';
+
 
 async function svgPng(svg: string, width: number, height: number) {
   // MCP Apps allow data images, while the host may prohibit blob: images.
@@ -8,7 +10,7 @@ async function svgPng(svg: string, width: number, height: number) {
   image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   await image.decode();
   const canvas = document.createElement('canvas'); canvas.width = width * 2; canvas.height = height * 2;
-  const context = canvas.getContext('2d'); if (!context) throw new Error('浏览器无法导出 PNG。');
+  const context = canvas.getContext('2d'); if (!context) throw new CodedError(ERROR_CODES.CHART_OPERATION_FAILED, '浏览器无法导出 PNG。');
   context.fillStyle = '#ffffff'; context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(image, 0, 0, canvas.width, canvas.height); return canvas.toDataURL('image/png');
 }

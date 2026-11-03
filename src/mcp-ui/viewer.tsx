@@ -5,6 +5,8 @@ import { ChartRenderer } from '../chart/react.tsx';
 import { GoogleMapRenderer } from '../maps/react.tsx';
 import { mapsUrl } from '../maps/core.ts';
 import './viewer.css';
+import { CodedError, ERROR_CODES } from '../errors.ts';
+
 
 const config = (window as any).__CAPABILITY_UI__ || { mode: 'app' };
 const root = createRoot(document.getElementById('root')!);
@@ -52,7 +54,7 @@ async function downloadFile(data: Blob | string, filename: string) {
   if (!app) return;
   const file = typeof data === 'string' ? (() => {
     const match = /^data:([^;,]+);base64,(.*)$/.exec(data);
-    if (!match) throw new Error('无法读取导出图片。');
+    if (!match) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, '无法读取导出图片。');
     return new Blob([Uint8Array.from(atob(match[2]), c => c.charCodeAt(0))], {type:match[1]});
   })() : data;
   const encoded = await new Promise<string>((resolve,reject) => {
@@ -60,20 +62,20 @@ async function downloadFile(data: Blob | string, filename: string) {
     reader.onerror = () => reject(reader.error); reader.readAsDataURL(file);
   });
   if (!app.getHostCapabilities()?.downloadFile) {
-    if (!current.previewUrl || !current.exportToolName) throw new Error('当前宿主不支持下载；请启用浏览器预览后导出。');
+    if (!current.previewUrl || !current.exportToolName) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, '当前宿主不支持下载；请启用浏览器预览后导出。');
     const prepared = await app.callServerTool({name:current.exportToolName,arguments:{
       token:current.token,filename,mimeType:file.type.split(';')[0],base64:encoded,
     }});
     const url = (prepared.structuredContent as any)?.url;
-    if (prepared.isError || !url) throw new Error(prepared.content?.filter(c=>c.type==='text').map(c=>(c as any).text).join('\n') || '导出失败。');
+    if (prepared.isError || !url) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, prepared.content?.filter(c=>c.type==='text').map(c=>(c as any).text).join('\n') || '导出失败。');
     const result = await app.openLink({url});
-    if (result.isError) throw new Error('宿主未打开下载链接；请在浏览器预览中导出。');
+    if (result.isError) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, '宿主未打开下载链接；请在浏览器预览中导出。');
     return;
   }
   const result = await app.downloadFile({contents:[{type:'resource',resource:{
     uri:`file:///${encodeURIComponent(filename)}`,mimeType:file.type || 'application/octet-stream',blob:encoded,
   }}]});
-  if (result.isError) throw new Error('下载未完成：宿主取消或拒绝了下载。');
+  if (result.isError) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, '下载未完成：宿主取消或拒绝了下载。');
 }
 
 async function request(action: 'read' | 'update', input: any = {}) {
@@ -82,18 +84,18 @@ async function request(action: 'read' | 'update', input: any = {}) {
       reason: action === 'read' ? 'Refresh visualization' : 'Save chart edit',
       ...(current.kind === 'chart' ? {action, chartId: current.id, ...input} : {mapId: current.id}),
     } });
-    if (result.isError) throw Object.assign(new Error(result.content?.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n') || '操作失败'), {
+    if (result.isError) throw Object.assign(new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, result.content?.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n') || '操作失败'), {
       code: (result.structuredContent as any)?.error?.code,
     });
     const view = result._meta?.['capability/visualization'];
-    if (!view) throw new Error('服务没有返回可视化数据，请重新调用工具。');
+    if (!view) throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, '服务没有返回可视化数据，请重新调用工具。');
     current = view;
     return view;
   }
   const response = await fetch(config.dataUrl, action === 'update'
     ? {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input)} : undefined);
   const value = await response.json();
-  if (!response.ok) throw Object.assign(new Error(value.error || '读取失败'), {status:response.status});
+  if (!response.ok) throw Object.assign(new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, value.error || '读取失败'), {status:response.status});
   current = value; return value;
 }
 

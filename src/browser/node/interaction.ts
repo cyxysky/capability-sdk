@@ -4,6 +4,8 @@ import { browserCodeHasImageOperation } from './browser-code-runner.ts';
 import { z } from 'zod';
 import { visualBrowserInputSchema } from '../interaction-schema.ts';
 import { browserCodeDescription } from '../index.ts';
+import { CodedError, ERROR_CODES } from '../../errors.ts';
+
 export const browserSessionCommandShape = {
   ...visualBrowserInputSchema.shape,
   reason: z.string().min(1).max(300).optional(),
@@ -46,7 +48,7 @@ export async function executeBrowserSessionOperation(session: BrowserSession, co
         ...(activeAxData?.nextCursor ? { playwrightAxCursor: activeAxData.nextCursor } : {}) },
         summary: `Read ${snapshot.returnedEntries} ${snapshot.mode} browser snapshot entries and the active Playwright AX tree; use current DOM UIDs or roles/names for locators and nextCursor when hasMore is true.` };
     } catch (error) {
-      return { ok: false, failureCategory: 'browser-snapshot-stale',
+      return { ok: false, failureCategory: ERROR_CODES.BROWSER_SNAPSHOT_STALE,
         actual: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -71,7 +73,7 @@ export async function executeBrowserSessionOperation(session: BrowserSession, co
   if (command.action === 'state') return session.readBrowserState({ ...command, abortSignal: signal });
   if (command.action === 'code') {
     const code = command.code;
-    if (!code) throw new Error('code is required for browser action=code.');
+    if (!code) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'code is required for browser action=code.');
     const imageInputAvailable = options.imageInputAvailable !== false;
     if (!imageInputAvailable && browserCodeHasImageOperation(code)) return { ok: false, actual: 'Browser images are unavailable in this mode/model. Use current DOM and locators.' };
     const result = await session.executeBrowserCode({ ...command, code, imageInputAvailable, ensureStarted: options.ensureStarted,

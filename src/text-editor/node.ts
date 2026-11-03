@@ -2,10 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { createCapabilityDocumentDatabase } from '../node.ts';
 import type { CapabilityExecutionContext } from '../index.ts';
 import { textEditorInput, type TextArtifact, type TextDocument, type TextDocumentSummary, type TextEditorOperations } from './index.ts';
+import { CodedError, ERROR_CODES } from '../errors.ts';
+
 
 export function createTextDocumentStore(directory: string) {
   return createCapabilityDocumentDatabase<TextDocument>({ directory, filename: 'documents.db', legacyFilename: 'documents.json',
-    readLegacy(value) { if (!Array.isArray(value)) throw new Error('Invalid legacy text documents.'); return value as TextDocument[]; } });
+    readLegacy(value) { if (!Array.isArray(value)) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'Invalid legacy text documents.'); return value as TextDocument[]; } });
 }
 export function textDocumentSummary(document: TextDocument): TextDocumentSummary {
   const { content, ...metadata } = document; return { ...metadata, contentChars: content.length };
@@ -13,10 +15,10 @@ export function textDocumentSummary(document: TextDocument): TextDocumentSummary
 export function replaceDocumentText(content: string, edits: readonly { oldText: string; newText: string }[]) {
   let result = content;
   for (const edit of edits) {
-    if (!edit.oldText) throw new Error('oldText must not be empty.');
+    if (!edit.oldText) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'oldText must not be empty.');
     const start = result.indexOf(edit.oldText);
-    if (start < 0) throw new Error('The original text was not found. Read the current source before editing.');
-    if (result.indexOf(edit.oldText, start + 1) >= 0) throw new Error('The original text is ambiguous. Include more surrounding source.');
+    if (start < 0) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'The original text was not found. Read the current source before editing.');
+    if (result.indexOf(edit.oldText, start + 1) >= 0) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'The original text is ambiguous. Include more surrounding source.');
     result = result.slice(0, start) + edit.newText + result.slice(start + edit.oldText.length);
   }
   return result;
@@ -26,7 +28,7 @@ export function createFileTextEditorOperations(options: {
   publishArtifact(fileName: string, content: string, context: CapabilityExecutionContext): Promise<TextArtifact>;
 }): TextEditorOperations {
   const store = createTextDocumentStore(options.directory);
-  function get(id: string) { const document = store.get(id); if (!document) throw new Error('Text document not found. Use list to find an existing document.'); return document; }
+  function get(id: string) { const document = store.get(id); if (!document) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'Text document not found. Use list to find an existing document.'); return document; }
   return { async execute(raw, context) {
     const input = textEditorInput.parse(raw); context.abortSignal?.throwIfAborted(); options.prepareStore?.(store);
     if (input.action === 'list') return { documents: store.database().prepare('SELECT record_json FROM records ORDER BY updated_at DESC, id DESC').all()
@@ -39,7 +41,7 @@ export function createFileTextEditorOperations(options: {
       const document = get(input.documentId!);
       if ((input.expectedContent !== undefined && input.expectedContent !== document.content)
         || (input.expectedTitle !== undefined && input.expectedTitle !== document.title)
-        || (input.expectedFormat !== undefined && input.expectedFormat !== document.format)) throw new Error('文档已在其他位置修改，请重新读取后再保存。');
+        || (input.expectedFormat !== undefined && input.expectedFormat !== document.format)) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, '文档已在其他位置修改，请重新读取后再保存。');
       if (input.action === 'delete') {
         db.prepare('DELETE FROM records WHERE id=?').run(document.id);
         if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edit_proposals'").get()) db.prepare("DELETE FROM edit_proposals WHERE json_extract(data, '$.documentId')=?").run(document.id);
@@ -56,10 +58,10 @@ export function createFileTextEditorOperations(options: {
     const document = get(input.documentId!);
     if (input.action === 'read') {
       const offset = input.offset ?? 0;
-      if (offset > document.content.length) throw new Error('Read offset is beyond the end of the document.');
+      if (offset > document.content.length) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'Read offset is beyond the end of the document.');
       const splitsCharacter = (position: number) => position > 0 && position < document.content.length
         && /[\uD800-\uDBFF]/.test(document.content[position - 1]) && /[\uDC00-\uDFFF]/.test(document.content[position]);
-      if (splitsCharacter(offset)) throw new Error('Read offset splits a Unicode character. Follow contentRange.nextOffset.');
+      if (splitsCharacter(offset)) throw new CodedError(ERROR_CODES.TEXT_EDITOR_OPERATION_FAILED, 'Read offset splits a Unicode character. Follow contentRange.nextOffset.');
       let end = input.offset !== undefined || input.limit !== undefined ? Math.min(document.content.length, offset + (input.limit ?? 2000)) : document.content.length;
       if (splitsCharacter(end)) end = end - 1 === offset ? end + 1 : end - 1;
       return { documentId: document.id, document: { ...document, content: document.content.slice(offset, end) },
