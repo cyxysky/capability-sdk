@@ -5,6 +5,7 @@ import { prepareGlinerService } from './local-runtime.ts';
 export * from './client.ts';
 export * from './config.ts';
 export * from './local-runtime.ts';
+export * from './runtime-installer.ts';
 
 let lastFailOpenWarningAt = 0;
 
@@ -19,10 +20,11 @@ function warnFailOpen(error: unknown) {
 export function createNodeSensitiveDataFilter(options: {
   getConfig: () => import('./config.ts').SensitiveDataFilterConfig;
   onFailOpen?: (error: unknown) => void;
+  prepareEndpoint?: (endpoint: string) => Promise<string>;
 }) {
   const redact = createSensitiveDataRedactor({
     getConfig: options.getConfig,
-    prepareEndpoint: prepareGlinerService,
+    prepareEndpoint: options.prepareEndpoint || prepareGlinerService,
   });
   return {
     redactSensitiveTexts: redact,

@@ -1,5 +1,6 @@
 import { getErrorCode, normalizeErrorCode } from "../errors.ts";
-import { browserRuntimeSkill } from './runtime-skill.ts';
+import { browserRuntimeSkill, browserRuntimeReferenceSkills, browserInteractiveQaSkill } from './runtime-skill.ts';
+import type { BrowserCodeAttachmentBinding, BrowserCodeCredentialBinding } from './node/browser-code-runner.ts';
 import { validateBrowserVisualInput } from './interaction-schema.ts';
 import { browserSessionCommandShape, executeBrowserSessionOperation, type BrowserSessionCommand } from './node/interaction.ts';
 import { readFile } from 'node:fs/promises';
@@ -20,10 +21,10 @@ import {
 } from '../index.ts';
 import { z } from 'zod';
 import { browserOperationSummary, browserCodeDescription } from './index.ts';
-import {
+import type {
   BrowserSession,
-  type BrowserActionResult,
-  type BrowserSessionOptions,
+  BrowserActionResult,
+  BrowserSessionOptions,
 } from './node/browser-session.ts';
 import { ERROR_CODES } from '../errors.ts';
 
@@ -33,9 +34,12 @@ const browserParser = z.object({
   ...browserSessionCommandShape,
   action: z.enum(['open','close',...browserSessionCommandShape.action.options]),
   browserSessionId: browserSessionId.optional().describe('Required except open. Use the exact id returned by open.'),
+  attachmentArtifactIds: z.array(z.string().trim().min(1).max(1024)).min(1).max(10).optional()
+    .describe('code only: artifactIds returned by file/code tools. Registers these artifacts for attachmentVault.setInputFiles(locator, artifactId); no local paths.'),
 }).strict().superRefine((input, ctx) => {
   if (input.action !== 'open' && !input.browserSessionId) ctx.addIssue({code:'custom',path:['browserSessionId'],message:'This action requires browserSessionId from open.'});
   if (input.action === 'code' && !input.code) ctx.addIssue({code:'custom',path:['code'],message:'code requires JavaScript.'});
+  if (input.attachmentArtifactIds && input.action !== 'code') ctx.addIssue({code:'custom',path:['attachmentArtifactIds'],message:'Attachments are only supported for code.'});
   validateBrowserVisualInput(input, ctx);
 });
 const browserInput = defineCapabilityInput(z.toJSONSchema(browserParser), (value) => browserParser.parse(value));
@@ -56,6 +60,9 @@ export type BrowserMcpSessionManagerOptions = {
   /** Closes forgotten sessions after inactivity. Set to 0 to disable expiry. */
   idleTimeoutMs?: number;
   sessionOptions?: BrowserSessionOptions;
+  resolveAttachmentArtifact?: (artifactId: string) => Promise<Omit<BrowserCodeAttachmentBinding, 'ref'>>;
+  resolveCredentials?: () => Promise<BrowserCodeCredentialBinding[]>;
+  resolveTarget?: () => Promise<string | undefined>;
 };
 
 async function browserResult(
@@ -70,10 +77,16 @@ async function browserResult(
     ...(result.browserObservation ? { observation: result.browserObservation } : {}),
   };
   const imagePaths = [...new Set([...(result.referenceImagePaths || []), result.referenceImagePath, result.browserObservation?.path].filter((value): value is string => Boolean(value)))];
-  const content = await Promise.all(imagePaths.map(async imagePath => {
-    try { return { type: 'image' as const, artifactId: imagePath, mediaType: /\.jpe?g$/i.test(imagePath) ? 'image/jpeg' : /\.webp$/i.test(imagePath) ? 'image/webp' : 'image/png', data: (await readFile(imagePath)).toString('base64') }; }
-    catch { return { type: 'text' as const, text: 'Screenshot unavailable. No image pixels were attached for this observation; inspect current state before continuing.' }; }
-  }));
+  const content: NonNullable<CapabilityResult['content']> = [];
+  for (const imagePath of imagePaths) {
+    try {
+      content.push({ type: 'image', artifactId: imagePath,
+        mediaType: /\.jpe?g$/i.test(imagePath) ? 'image/jpeg' : /\.webp$/i.test(imagePath) ? 'image/webp' : 'image/png',
+        data: (await readFile(imagePath)).toString('base64') });
+    } catch {
+      content.push({ type: 'text', text: 'Screenshot unavailable. No image pixels were attached for this observation; inspect current state before continuing.' });
+    }
+  }
   return result.ok
     ? { ok: true, summary: (result.manualVerification ? 'Human verification requested. The MCP client must ask the user to complete verification in the browser, then observe the current state before resuming; this response does not confirm verification.' : browserOperationSummary(result)), data, content }
     : {
@@ -118,14 +131,17 @@ export class BrowserMcpSessionManager {
     this.#openingSessions += 1;
     const id = randomUUID();
     const runId = `mcp-browser-${id}`;
-    const session = new BrowserSession({
-      headless: true,
-      isolated: true,
-      ...this.options.sessionOptions,
-      runId,
-      browserCodeStateSessionId: id,
-    });
+    let session: BrowserSession | undefined;
     try {
+      const { BrowserSession } = await import('./node/browser-session.ts');
+      abortSignal?.throwIfAborted();
+      session = new BrowserSession({
+        headless: true,
+        isolated: true,
+        ...this.options.sessionOptions,
+        runId,
+        browserCodeStateSessionId: id,
+      });
       await raceWithAbort(session.start(), abortSignal);
       if (inputValue.url) {
         const result = await session.open(inputValue.url, { abortSignal });
@@ -149,9 +165,9 @@ export class BrowserMcpSessionManager {
       const postActionState = await session.readBrowserState({scope:'active', maxOutputChars:4000, abortSignal})
         .catch(() => undefined);
       return browserResult(id, {ok:true, summary: 'Opened browser session ' + id + '.',
-        data: {url:session.currentUrl(), postActionState}, ...(observation ? {browserObservation:observation} : {})});
+        data: {url:session.currentUrl(), postActionState, browserTargetId: (await session.browserAutomationTarget()).targetId}, ...(observation ? {browserObservation:observation} : {})});
     } catch (error) {
-      await session.close({ force: true }).catch(() => undefined);
+      await session?.close({ force: true }).catch(() => undefined);
       return {
         ok: false,
         error: {
@@ -166,6 +182,8 @@ export class BrowserMcpSessionManager {
 
   async operate(input: z.infer<typeof browserParser>, abortSignal?: AbortSignal): Promise<CapabilityResult> {
     return this.#enqueue(input.browserSessionId!, async managed => {
+      const targetId = await this.options.resolveTarget?.();
+      if (targetId) await managed.session.selectAutomationTarget(targetId);
       managed.stepIndex += 1;
       if (input.action === 'images') {
         const requested = input.imageIds || [];
@@ -176,9 +194,33 @@ export class BrowserMcpSessionManager {
         return browserResult(input.browserSessionId!, {ok:true, actual:'Selected browser image evidence; only the latest observation can authorize interaction.',
           data:{observations:images}, referenceImagePaths:images.flatMap(image => image.path ? [image.path] : [])});
       }
+      let attachments: BrowserCodeAttachmentBinding[] | undefined;
+      if (input.attachmentArtifactIds) {
+        try {
+          const resolveArtifact = this.options.resolveAttachmentArtifact;
+          if (!resolveArtifact) throw new Error('This browser host has no attachment artifact resolver.');
+          // Resolve every artifact before executing any code or input. Paths
+          // are supplied only by the trusted host, never by browser scripts.
+          attachments = await Promise.all([...new Set(input.attachmentArtifactIds)].map(async artifactId => ({
+            ...await resolveArtifact(artifactId), ref: artifactId,
+          })));
+        } catch (error) {
+          return { ok: false, error: {
+            code: ERROR_CODES.BROWSER_ATTACHMENT_INVALID,
+            message: error instanceof Error ? error.message : String(error),
+            details: { browserSessionId: input.browserSessionId, executionState: {
+              status: 'failed', phase: 'startup', attemptedActions: [], completedActions: [],
+              outcome: 'not-started', requiresStateRefresh: false, safeToRetry: false,
+            } },
+          } };
+        }
+      }
       let result = await executeBrowserSessionOperation(managed.session, input as BrowserSessionCommand, {
-        mode:'hybrid', runId:managed.runId, stepIndex:managed.stepIndex, abortSignal,
+        mode:'hybrid', runId:managed.runId, stepIndex:managed.stepIndex, abortSignal, attachments,
+        credentials: await this.options.resolveCredentials?.(),
       });
+      const browserTargetId = await managed.session.browserAutomationTarget().then(value => value.targetId).catch(() => undefined);
+      if (browserTargetId) result = { ...result, data: { ...(result.data && typeof result.data === 'object' ? result.data : { result: result.data }), browserTargetId } };
       if (['navigate','tabs'].includes(input.action) && !(input.action === 'tabs' && input.tabOperation === 'list')) {
         const observation = await managed.session.captureBrowserObservation(managed.runId, abortSignal).catch(() => undefined);
         if (observation) result = {...result, browserObservation:observation};
@@ -271,6 +313,9 @@ export type BrowserMcpOptions = {
   maxSessions?: number;
   idleTimeoutMs?: number;
   sessionOptions?: BrowserSessionOptions | ((context: CapabilityRunContext) => BrowserSessionOptions | Promise<BrowserSessionOptions>);
+  resolveAttachmentArtifact?: BrowserMcpSessionManagerOptions['resolveAttachmentArtifact'];
+  resolveCredentials?: BrowserMcpSessionManagerOptions['resolveCredentials'];
+  resolveTarget?: BrowserMcpSessionManagerOptions['resolveTarget'];
 };
 
 export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): CapabilityProvider {
@@ -279,7 +324,7 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
     title: 'Explicit browser sessions',
     summary: '<system_skill><id>com.webpilot.browser.mcp/runtime</id><title>Explicit browser sessions</title><required>true</required></system_skill>',
     required: true,
-    content: 'Inspect returned DOM and actual screenshot images after actions. Use dismissSurface first for selector/menu option surfaces; it clicks (0,0), and closureConfirmed must be checked. Use Close/Cancel buttons first for dialogs. observe returns observationId for act; coordinates use CSS viewport pixels. act supports complete clicks, drags, scrolls, typing and key chords. state reads AX; snapshot reads interactive DOM plus AX. navigate/tabs manage pages through browser controls. images rereads known observations. Only actions listed in this schema are available. Use the browser tool with action="open" first. Pass its exact browserSessionId to every subsequent action. code executes JavaScript with page, browser and nodeRepl. snapshot reads page/tabs without running code. close releases the session. Do not invent or reuse closed session ids.',
+    content: 'Inspect returned DOM and actual screenshot images after actions. Use dismissSurface for an observed popup/menu/dialog; it prefers a unique semantic Close/Cancel or close-icon control within that surface, then falls back to (0,0). No observed surface means no input. Check closureConfirmed; unverified closure is a failed result. Explicit observed Close/Cancel controls are valid too. observe returns observationId for act; coordinates use CSS viewport pixels. act supports complete clicks, drags, scrolls, typing and key chords. state reads AX; snapshot reads interactive DOM plus AX. navigate/tabs manage pages through browser controls. images rereads known observations. Only actions listed in this schema are available. Use the browser tool with action="open" first. Pass its exact browserSessionId to every subsequent action. code executes JavaScript with page, browser and nodeRepl. snapshot reads page/tabs without running code. close releases the session. Do not invent or reuse closed session ids.',
   } as const;
   return {
     manifest: {
@@ -288,9 +333,9 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
       name: 'Browser MCP sessions',
       version: '0.1.0',
       description: 'Explicit, isolated Playwright browser sessions for MCP clients.',
-      permissions: ['browser:launch', 'browser:cdp', 'network:access', 'artifact:write'],
+      permissions: ['browser:launch', 'browser:cdp', 'network:access', 'artifact:read', 'artifact:write'],
       runtimeRequirements: { node: '>=22.16', patchright: '1.63.0' },
-      skills: [browserRuntimeSkill, runtimeSkill],
+      skills: [browserRuntimeSkill, ...browserRuntimeReferenceSkills, browserInteractiveQaSkill, runtimeSkill],
     },
     async createRuntime(context) {
       const sessionOptions = typeof options.sessionOptions === 'function'
@@ -299,6 +344,9 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
       const manager = new BrowserMcpSessionManager({
         maxSessions: options.maxSessions,
         idleTimeoutMs: options.idleTimeoutMs,
+        resolveAttachmentArtifact: options.resolveAttachmentArtifact,
+        resolveCredentials: options.resolveCredentials,
+        resolveTarget: options.resolveTarget,
         sessionOptions: {
           ...sessionOptions,
           configuration: {
@@ -311,7 +359,7 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
         tools: {
           browser: defineCapabilityTool({
             name: 'browser',
-            description: 'Browser sessions with open/close, code, state (AX), snapshot (interactive DOM), navigate, tabs, observe, act, images, dismissSurface and waitForHumanVerification. All except open require browserSessionId. Inspect returned postActionState and actual image content. dismissSurface clicks (0,0) for option popups; use explicit Close/Cancel first for dialogs and verify closureConfirmed. ' + browserCodeDescription,
+            description: 'Browser sessions with open/close, code, state (AX), snapshot (interactive DOM), navigate, tabs, observe, act, images, dismissSurface and waitForHumanVerification. All except open require browserSessionId. Inspect and attempt ordinary verification through the page UI before requesting human help; pause after bounded attempts fail or user-owned credentials/OTP/QR/device approval are required. Inspect returned postActionState and actual image content. dismissSurface clicks (0,0) for option popups; use explicit Close/Cancel first for dialogs and verify closureConfirmed. ' + browserCodeDescription,
             input: browserInput,
             execute: (value, execution) => {
               switch (value.action) {

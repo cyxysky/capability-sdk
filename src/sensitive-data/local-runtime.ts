@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path, { dirname } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readManagedRuntime, managedModelDirectory, runtimeDirectory } from '../runtime.ts';
+import { readManagedSensitiveDataRuntime, managedModelDirectory, runtimeDirectory } from '../runtime.ts';
 import {
   defaultLiquidPiiModel,
   normalizedGlinerModelName,
@@ -19,6 +19,7 @@ type LocalGlinerRuntimeState = {
   startPromise?: Promise<string>;
   revision?: string;
   shutdownRegistered?: boolean;
+  configurationRevision?: string;
 };
 
 const globalRuntime = globalThis as typeof globalThis & {
@@ -42,6 +43,7 @@ function isLoopbackHost(hostname: string) {
 export function localGlinerServiceDirectories(projectRoot = process.cwd(), configuredDirectory = '') {
   return [...new Set([
     configuredDirectory ? path.resolve(configuredDirectory) : '',
+    process.env.CAPABILITY_SDK_ROOT ? path.join(process.env.CAPABILITY_SDK_ROOT, 'runtime', 'sensitive-data', 'python') : '',
     ...bundledGlinerRuntimeDirectories(projectRoot).map((runtimeRoot) => path.join(runtimeRoot, 'service')),
     path.resolve(packageRoot, 'runtime', 'sensitive-data', 'python'),
     path.resolve(projectRoot, 'packages', 'capability-sdk', 'runtime', 'sensitive-data', 'python'),
@@ -73,10 +75,8 @@ export function localGlinerPythonCandidates(projectRoot = process.cwd(), configu
   const executable = process.platform === 'win32' ? 'python.exe' : 'python';
   return [...new Set([
     configuredPath ? path.resolve(configuredPath) : '',
-    readManagedRuntime()?.python || '',
+    readManagedSensitiveDataRuntime()?.python || '',
     ...bundledGlinerRuntimeDirectories(projectRoot).map((runtimeRoot) => path.join(runtimeRoot, 'python', executable)),
-    path.resolve(projectRoot, '.venv-gliner', process.platform === 'win32' ? 'Scripts' : 'bin', executable),
-    path.resolve(projectRoot, '..', '.venv-gliner', process.platform === 'win32' ? 'Scripts' : 'bin', executable),
   ].filter(Boolean))];
 }
 
@@ -88,10 +88,11 @@ function bundledModelDirectory(
     manifestKey: 'modelName' | 'chineseNerModelName' | 'piiModelName';
     relativePath: string[];
   },
+  environment: Readonly<Record<string, string | undefined>> = process.env,
 ) {
-  const configured = String(process.env[options.bundleEnvironmentKey] || '').trim();
+  const configured = String(environment[options.bundleEnvironmentKey] || '').trim();
   const modelKey = options.manifestKey === 'modelName' ? 'gliner' : options.manifestKey === 'piiModelName' ? 'pii' : 'chinese';
-  const requestedModel = String(process.env[options.configuredEnvironmentKey] || '').trim();
+  const requestedModel = String(environment[options.configuredEnvironmentKey] || '').trim();
   const managed = managedModelDirectory(modelKey, requestedModel);
   const candidates = [
     ...(configured ? [path.resolve(configured)] : []),
@@ -109,8 +110,8 @@ function bundledModelDirectory(
       // An explicitly supplied bundle directory can omit the build manifest.
     }
     const configuredModel = options.configuredEnvironmentKey === 'GLINER_MODEL'
-      ? normalizedGlinerModelName(process.env.GLINER_MODEL)
-      : String(process.env[options.configuredEnvironmentKey] || '').trim();
+      ? normalizedGlinerModelName(environment.GLINER_MODEL)
+      : String(environment[options.configuredEnvironmentKey] || '').trim();
     if (!configuredModel || !bundledModelName || configuredModel === bundledModelName) return modelDirectory;
   }
   return '';
@@ -142,8 +143,8 @@ async function serviceHealthy(endpoint: string, timeoutMs = 800, expectedRevisio
   }
 }
 
-function startupTimeoutMs() {
-  const configured = Number(process.env.GLINER_LOCAL_STARTUP_TIMEOUT_MS || 600_000);
+function startupTimeoutMs(environment: Readonly<Record<string, string | undefined>>) {
+  const configured = Number(environment.GLINER_LOCAL_STARTUP_TIMEOUT_MS || 600_000);
   return Number.isFinite(configured) && configured > 0
     ? Math.min(Math.floor(configured), 900_000)
     : 600_000;
@@ -155,7 +156,18 @@ function stopManagedSidecar() {
   runtimeState.endpoint = undefined;
   runtimeState.revision = undefined;
   runtimeState.startPromise = undefined;
-  if (child && child.exitCode === null && !child.killed) child.kill();
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise<void>(resolve => {
+    const timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }, 3000);
+    timer.unref();
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill();
+  });
 }
 
 function registerShutdown() {
@@ -166,16 +178,16 @@ function registerShutdown() {
   process.once('exit', stopManagedSidecar);
 }
 
-async function waitForService(endpoint: string, child: ChildProcess, expectedRevision: string) {
-  const deadline = Date.now() + startupTimeoutMs();
+async function waitForService(endpoint: string, child: ChildProcess, expectedRevision: string, environment: Readonly<Record<string, string | undefined>>) {
+  const deadline = Date.now() + startupTimeoutMs(environment);
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.killed) {
-      throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local GLiNER process exited before becoming ready. Run "npm run sensitive-data:install" and check the startup output.');
+      throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local GLiNER process exited before becoming ready. Download the local components from Settings and check the startup output.');
     }
     if (await serviceHealthy(endpoint, 1_000, expectedRevision)) return endpoint;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local GLiNER startup timed out. The first model download can take several minutes; check network access and the GLiNER startup output.');
+  throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local GLiNER startup timed out. Loading local models can take several minutes; check the GLiNER startup output.');
 }
 
 async function startManagedSidecar(
@@ -183,6 +195,7 @@ async function startManagedSidecar(
   projectRoot: string,
   serviceDirectory: string,
   serviceRevision: string,
+  environment: Readonly<Record<string, string | undefined>>,
 ) {
   if (await serviceHealthy(endpoint, 800, serviceRevision)) return endpoint;
   const url = new URL(endpoint);
@@ -190,27 +203,30 @@ async function startManagedSidecar(
     throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Managed local GLiNER requires a loopback HTTP GLINER_SERVICE_URL.');
   }
   const port = Number(url.port || 80);
-  const pythonCommand = resolvePythonCommand(projectRoot, String(process.env.GLINER_PYTHON_PATH || '').trim());
+  const pythonCommand = resolvePythonCommand(projectRoot, String(environment.GLINER_PYTHON_PATH || '').trim());
   const modelBundleDirectory = bundledModelDirectory(projectRoot, {
     bundleEnvironmentKey: 'GLINER_MODEL_BUNDLE_DIR',
     configuredEnvironmentKey: 'GLINER_MODEL',
     manifestKey: 'modelName',
     relativePath: ['models', 'gliner2'],
-  });
+  }, environment);
   const chineseNerModelBundleDirectory = bundledModelDirectory(projectRoot, {
     bundleEnvironmentKey: 'GLINER_CHINESE_NER_MODEL_BUNDLE_DIR',
     configuredEnvironmentKey: 'GLINER_CHINESE_NER_MODEL',
     manifestKey: 'chineseNerModelName',
     relativePath: ['models', 'chinese-roberta'],
-  });
+  }, environment);
   const piiModelBundleDirectory = bundledModelDirectory(projectRoot, {
     bundleEnvironmentKey: 'GLINER_PII_MODEL_BUNDLE_DIR',
     configuredEnvironmentKey: 'GLINER_PII_MODEL',
     manifestKey: 'piiModelName',
     relativePath: ['models', 'liquid-pii'],
-  });
-  const modelCacheDirectory = String(process.env.GLINER_MODEL_CACHE_DIR || '').trim()
-    || path.join(runtimeDirectory(), 'huggingface');
+  }, environment);
+  if (!modelBundleDirectory || !chineseNerModelBundleDirectory || !piiModelBundleDirectory) {
+    throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local sensitive-data models are not installed. Open Settings → Security & privacy → Local sensitive-data runtime and click Download.');
+  }
+  const modelCacheDirectory = String(environment.GLINER_MODEL_CACHE_DIR || '').trim()
+    || path.join(runtimeDirectory(), 'sensitive-data', 'huggingface');
   console.log(`[gliner-local] Starting ${pythonCommand} on ${url.hostname}:${port}.`);
   const child = spawn(pythonCommand, [
     '-m',
@@ -225,22 +241,21 @@ async function startManagedSidecar(
     cwd: serviceDirectory,
     env: {
       ...process.env,
-      GLINER_MODEL: modelBundleDirectory || normalizedGlinerModelName(process.env.GLINER_MODEL),
+      ...environment,
+      GLINER_MODEL: modelBundleDirectory || normalizedGlinerModelName(environment.GLINER_MODEL),
       ...(chineseNerModelBundleDirectory ? {
         GLINER_CHINESE_NER_MODEL: chineseNerModelBundleDirectory,
       } : {}),
       GLINER_PII_MODEL: piiModelBundleDirectory
-        || String(process.env.GLINER_PII_MODEL || '').trim()
+        || String(environment.GLINER_PII_MODEL || '').trim()
         || defaultLiquidPiiModel,
-      ...(modelBundleDirectory && chineseNerModelBundleDirectory && piiModelBundleDirectory ? {
-        HF_HUB_OFFLINE: '1',
-        TRANSFORMERS_OFFLINE: '1',
-      } : {}),
-      HF_HOME: process.env.HF_HOME || modelCacheDirectory,
-      HF_HUB_CACHE: process.env.HF_HUB_CACHE || path.join(modelCacheDirectory, 'hub'),
-      HF_MODULES_CACHE: process.env.HF_MODULES_CACHE || path.join(modelCacheDirectory, 'modules'),
-      HF_XET_CACHE: process.env.HF_XET_CACHE || path.join(modelCacheDirectory, 'xet'),
-      TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || path.join(modelCacheDirectory, 'hub'),
+      HF_HUB_OFFLINE: '1',
+      TRANSFORMERS_OFFLINE: '1',
+      HF_HOME: environment.HF_HOME || modelCacheDirectory,
+      HF_HUB_CACHE: environment.HF_HUB_CACHE || path.join(modelCacheDirectory, 'hub'),
+      HF_MODULES_CACHE: environment.HF_MODULES_CACHE || path.join(modelCacheDirectory, 'modules'),
+      HF_XET_CACHE: environment.HF_XET_CACHE || path.join(modelCacheDirectory, 'xet'),
+      TRANSFORMERS_CACHE: environment.TRANSFORMERS_CACHE || path.join(modelCacheDirectory, 'hub'),
     },
     stdio: ['ignore', 'inherit', 'inherit'],
     windowsHide: true,
@@ -260,13 +275,13 @@ async function startManagedSidecar(
       runtimeState.startPromise = undefined;
     }
   });
-  return waitForService(endpoint, child, serviceRevision);
+  return waitForService(endpoint, child, serviceRevision, environment);
 }
 
-export async function prepareGlinerService(endpoint: string) {
-  const mode = normalizedGlinerRuntimeMode(process.env.GLINER_RUNTIME_MODE);
+export async function prepareGlinerService(endpoint: string, environment: Readonly<Record<string, string | undefined>> = process.env) {
+  const mode = normalizedGlinerRuntimeMode(environment.GLINER_RUNTIME_MODE);
   if (mode === 'external') {
-    if (runtimeState.child) stopManagedSidecar();
+    if (runtimeState.child) await stopManagedSidecar();
     return endpoint;
   }
 
@@ -274,33 +289,40 @@ export async function prepareGlinerService(endpoint: string) {
   const url = new URL(endpoint);
   const serviceDirectory = resolveServiceDirectory(
     projectRoot,
-    String(process.env.GLINER_SERVICE_DIR || '').trim(),
+    String(environment.GLINER_SERVICE_DIR || '').trim(),
   );
   if (mode === 'auto' && (!isLoopbackHost(url.hostname) || !serviceDirectory)) {
-    if (runtimeState.child) stopManagedSidecar();
+    if (runtimeState.child) await stopManagedSidecar();
     return endpoint;
   }
   if (!serviceDirectory) {
     throw new CodedError(ERROR_CODES.CAPABILITY_EXECUTION_FAILED, 'Local GLiNER service files were not found. Set GLINER_SERVICE_DIR or use GLINER_RUNTIME_MODE=external.');
   }
   const serviceRevision = localGlinerServiceRevision(serviceDirectory);
-  if (runtimeState.child && (runtimeState.endpoint !== endpoint || runtimeState.revision !== serviceRevision)) {
-    stopManagedSidecar();
+  const configurationRevision = createHash('sha256').update(JSON.stringify(Object.entries(environment).filter(([key]) => key.startsWith('GLINER_')).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
+  if (runtimeState.child && (runtimeState.endpoint !== endpoint || runtimeState.revision !== serviceRevision || runtimeState.configurationRevision !== configurationRevision)) {
+    await stopManagedSidecar();
   }
+  if (runtimeState.startPromise && runtimeState.endpoint === endpoint) return runtimeState.startPromise;
   if (runtimeState.endpoint === endpoint && runtimeState.child && runtimeState.child.exitCode === null) {
     if (await serviceHealthy(endpoint, 800, serviceRevision)) return endpoint;
-    stopManagedSidecar();
+    await stopManagedSidecar();
   }
   if (!runtimeState.startPromise || runtimeState.endpoint !== endpoint) {
     runtimeState.endpoint = endpoint;
     runtimeState.revision = serviceRevision;
-    runtimeState.startPromise = startManagedSidecar(endpoint, projectRoot, serviceDirectory, serviceRevision).catch((error) => {
+    runtimeState.configurationRevision = configurationRevision;
+    const starting = startManagedSidecar(endpoint, projectRoot, serviceDirectory, serviceRevision, environment).then(result => {
+      if (runtimeState.startPromise === starting) runtimeState.startPromise = undefined;
+      return result;
+    }).catch((error) => {
       if (runtimeState.endpoint === endpoint) {
         runtimeState.startPromise = undefined;
         runtimeState.endpoint = undefined;
       }
       throw error;
     });
+    runtimeState.startPromise = starting;
   }
   return runtimeState.startPromise;
 }

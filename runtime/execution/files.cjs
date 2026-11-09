@@ -13,15 +13,21 @@ function relativeFile(value) {
   return value;
 }
 
-function decodeFile(file) {
+function filePayloadSize(file) {
   if (typeof file.base64 !== 'string' || file.base64.length > Math.ceil(MAX_FILE_BYTES / 3) * 4
     || file.base64.length % 4 !== 0
     || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.base64)) {
     throw new Error('Invalid or oversized file payload (maximum 10 MB per file).');
   }
-  const bytes = Buffer.from(file.base64, 'base64');
-  if (bytes.length > MAX_FILE_BYTES) throw new Error('File exceeds 10 MB.');
-  return bytes;
+  const padding = file.base64.endsWith('==') ? 2 : file.base64.endsWith('=') ? 1 : 0;
+  const size = file.base64.length / 4 * 3 - padding;
+  if (size > MAX_FILE_BYTES) throw new Error('File exceeds 10 MB.');
+  return size;
+}
+
+function decodeFile(file) {
+  filePayloadSize(file);
+  return Buffer.from(file.base64, 'base64');
 }
 
 async function stageFiles(directory, files = []) {
@@ -40,7 +46,7 @@ async function stageFiles(directory, files = []) {
   await mkdir(path.join(directory, 'outputs'), { recursive: true, mode: 0o777 });
 }
 
-async function collectFiles(directory, requested = []) {
+async function collectFiles(directory, requested = [], { allowMissing = false } = {}) {
   if (!Array.isArray(requested) || requested.length > MAX_FILES) throw new Error('At most 16 output files are allowed.');
   const names = new Set(requested.map(relativeFile));
   const root = await realpath(directory);
@@ -67,10 +73,12 @@ async function collectFiles(directory, requested = []) {
   const files = [];
   for (const name of names) {
     const full = path.join(directory, name);
+    const info = await lstat(full).catch(error => allowMissing && error.code === 'ENOENT' ? undefined : Promise.reject(error));
+    if (!info) continue;
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error('Output file must be a regular file inside this workspace.');
     const resolved = await realpath(full);
     const relative = path.relative(root, resolved);
-    const info = await lstat(full);
-    if (relative.startsWith('..') || path.isAbsolute(relative) || info.isSymbolicLink() || !info.isFile()) throw new Error('Output file must be a regular file inside this workspace.');
+    if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Output file must be a regular file inside this workspace.');
     if (info.size > MAX_FILE_BYTES) throw new Error(`Output file ${name} exceeds 10 MB.`);
     const bytes = await readFile(full);
     total += bytes.length;
@@ -80,4 +88,4 @@ async function collectFiles(directory, requested = []) {
   return files;
 }
 
-module.exports = { collectFiles, stageFiles, decodeFile, relativeFile, MAX_TOTAL_BYTES };
+module.exports = { collectFiles, stageFiles, decodeFile, filePayloadSize, relativeFile, MAX_TOTAL_BYTES };

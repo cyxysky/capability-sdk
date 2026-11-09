@@ -516,7 +516,23 @@
                     "./ui/floating-window":  {
                                                  "types":  "./dist/ui/floating-window.d.ts",
                                                  "import":  "./dist/ui/floating-window.js"
-                                             }
+                                            },
+                                            "./managed/node": {
+                                                "types": "./dist/managed/node.d.ts",
+                                                "import": "./dist/managed/node.js"
+                                            },
+                                            "./extensions": {
+                                                "types": "./dist/extensions/index.d.ts",
+                                                "import": "./dist/extensions/index.js"
+                                            },
+                                            "./extensions/node": {
+                                                "types": "./dist/extensions/node.d.ts",
+                                                "import": "./dist/extensions/node.js"
+                                            },
+                                            "./integrations/connectors/configuration-mcp": {
+                                                "types": "./dist/integrations/connectors/configuration-mcp.d.ts",
+                                                "import": "./dist/integrations/connectors/configuration-mcp.js"
+                                            }
                 },
     "scripts":  {
                     "typecheck":  "tsc -p tsconfig.build.json --noEmit",
@@ -529,7 +545,8 @@
                     "start-runtime":  "node scripts/sensitive-data/start-runtime.cjs",
                     "bundle-runtime":  "node scripts/sensitive-data/prepare-runtime.cjs",
                     "postinstall":  "node scripts/runtime.cjs install",
-                    "doctor":  "node scripts/runtime.cjs doctor"
+                    "doctor": "node scripts/runtime.cjs doctor",
+                    "install-sensitive-data": "node scripts/runtime.cjs install sensitive-data"
                 },
     "engines":  {
                     "node":  "\u003e=22.16"
@@ -595,7 +612,12 @@
                          "undici":  "^7.29.0",
                          "ws":  "8.21.3",
                          "xlsx":  "^0.18.5",
-                         "zod":  "^4.4.3"
+                        "zod": "^4.4.3",
+                        "@ai-sdk/mcp": "^2.0.30",
+                        "node-unrar-js": "^2.0.2",
+                        "quickjs-emscripten": "0.32.0",
+                        "cross-spawn": "^7.0.6",
+                        "patchright-core": "1.63.0"
                      },
     "bin":  {
                 "capability-install":  "install.mjs",

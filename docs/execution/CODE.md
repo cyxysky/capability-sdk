@@ -334,6 +334,34 @@ export const provider = createCodeSandboxCapability({
 });
 ```
 
+## Linux runner isolation
+
+The HTTP runner provisions reserved execution accounts at image build time with
+`node runtime/execution/isolation.cjs --provision` (use the staged runtime path in
+a packaged application). Jobs lease distinct UID/GID pairs using OS file locks.
+They receive a private workspace, HOME and TMP directory, plus an inherited
+Landlock policy allowing writes only in that workspace and reads from the
+required system runtime. Output collection follows process cleanup; workspace
+cleanup completes before a user identity can be leased again.
+
+Linux isolation requires Landlock ABI 3 or newer, `flock`, Python 3, a root
+coordinator with CHOWN, DAC_OVERRIDE, KILL, SETGID and SETUID, and
+`no-new-privileges`. The task processes receive none of those coordinator
+capabilities. Use an exec-enabled temporary mount for virtual environments and
+native dependencies, and an init process to reap children. Missing isolation
+prerequisites produce an unhealthy runner instead of falling back to a shared
+user. Non-Linux local execution remains a trusted development capability, not
+this Linux isolation boundary.
+
+The HTTP runner declares `isolation: "linux-landlock-v1"` in healthy responses.
+Hosts that require this boundary pass `requiredIsolation: 'linux-landlock-v1'`
+to `createHttpCodeSandboxExecutor` or `createHttpCodeSandboxCapability`. The
+executor verifies the requirement before dispatching code; an older or
+misconfigured runner cannot silently satisfy the deployment policy.
+
+The runner still shares the configured network and container resource limits.
+This is not a separate network or resource container for each job.
+
 ## Additional package reference
 
 The following pre-existing reference includes focused API fragments and application integration notes. The complete runnable entrypoints are the numbered tutorial above; do not concatenate unrelated snippets.
@@ -342,8 +370,9 @@ The following pre-existing reference includes focused API fragments and applicat
 
 Bounded Python and JavaScript execution for agents. The portable core accepts
 an injected executor. The local Node adapter is only for trusted single-machine
-development; production deployments should use the HTTP runner in
-`Dockerfile.code-sandbox`.
+development; production deployments should use the HTTP runner. Orbit's
+`docker-compose.yml` starts it from the same `orbit` image with the command
+`node server/code-sandbox-runner.js`, in a separate restricted container.
 
 ### TypeScript Agent framework integration
 
@@ -369,6 +398,9 @@ JavaScript runs as Node.js ESM (`.mjs`): use `import`, including for installed
 packages. Bare `require` is not defined; use `createRequire(import.meta.url)`
 explicitly if needed. Each execution has a disposable directory. Write files
 under `outputs/` (created by the runner), or list extra relative `outputFiles`.
+If code fails before creating a requested file, the runner returns its original
+exit code and stderr, along with any files it already produced. Successful code
+must still create every explicitly requested output file.
 The runner exports them before cleanup over a separate file channel: 16 files,
 10 MB per file, 32 MB total. Symlinks and workspace escapes are rejected.
 The application host persists them and returns `artifacts` with IDs, preview

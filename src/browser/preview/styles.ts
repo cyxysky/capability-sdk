@@ -207,11 +207,25 @@ export const browserPreviewStyles = String.raw`
   cursor: default;
 }
 
-.cap-browser-preview-stage:focus-visible {
+.cap-browser-preview-stage:focus-visible,
+.cap-browser-preview-stage:has(> .cap-browser-preview-keyboard-input:focus-visible) {
   box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent-strong, #36583f) 72%, transparent);
 }
 
-.cap-browser-preview-stage img,
+.cap-browser-preview-keyboard-input {
+  border: 0;
+  height: 1px;
+  left: 0;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  position: absolute;
+  resize: none;
+  top: 0;
+  width: 1px;
+}
+
+.cap-browser-preview-stage canvas,
 .cap-browser-preview-stage video {
   background: #111318;
   contain: paint;
@@ -220,6 +234,8 @@ export const browserPreviewStyles = String.raw`
   object-fit: contain;
   object-position: center;
   pointer-events: none;
+  position: absolute;
+  inset: 0;
   width: 100%;
 }
 
@@ -234,7 +250,7 @@ export const browserPreviewStyles = String.raw`
   opacity: 0;
 }
 
-.cap-browser-preview-stage img {
+.cap-browser-preview-stage canvas {
   image-rendering: auto;
 }
 
@@ -399,9 +415,20 @@ export const browserPreviewStyles = String.raw`
   display: flex;
   flex-direction: column;
   gap: 9px;
-  max-width: 420px;
+  inset: 0;
+  justify-content: center;
+  min-width: 0;
+  overflow: auto;
   padding: 28px;
+  position: absolute;
   text-align: center;
+  z-index: 1;
+}
+
+.cap-browser-preview-empty > strong,
+.cap-browser-preview-empty > span {
+  max-width: 420px;
+  overflow-wrap: anywhere;
 }
 
 .cap-browser-preview-empty strong {

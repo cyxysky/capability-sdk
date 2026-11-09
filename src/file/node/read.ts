@@ -1,17 +1,14 @@
 import { readFile, stat } from 'node:fs/promises';
-import sharp from 'sharp';
 import { fileFormatForName, normalizedFileExtension } from '../formats.ts';
 import type { FileVisualToolInput } from '../types.ts';
 import type {
   OfficeVisualQaDeckChecks,
   OfficeVisualQaPageChecks,
 } from '../office/types.ts';
-import { renderFilePreview } from './office/preview.ts';
 import { sha256NodeFile } from './artifacts.ts';
 import { createFileVisualIndex, fileVisualScreenshotId as screenshotId } from './visual-index.ts';
-import { extractFileTextInWorker, type FileTextSelection, type FileTextExtractionResult } from './text-extraction.ts';
+import type { FileTextSelection, FileTextExtractionResult } from './text-extraction.ts';
 import { CodedError, ERROR_CODES } from '../../errors.ts';
-
 
 export type FileReadableAttachment = {
   id: string;
@@ -120,6 +117,7 @@ async function extractAttachmentText(attachment: FileReadableAttachment, absolut
   const kind = attachmentKind(attachment);
   if (kind === 'image') {
     if (!absolutePath) throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, 'Could not locate the saved image artifact.');
+    const { default: sharp } = await import('sharp');
     const metadata = await sharp(reusableBuffer || absolutePath, { failOn: 'none' }).metadata();
     const savedBytes = reusableBuffer?.byteLength ?? attachment.size ?? (await stat(absolutePath)).size;
     const rawWidth = metadata.width || 0;
@@ -140,6 +138,7 @@ async function extractAttachmentText(attachment: FileReadableAttachment, absolut
   }
   if (kind === 'tab') return { parser: 'tab', truncated: false, warnings: [], text: `[标签页引用：${attachment.sourceUrl || attachment.url || attachment.name}]` };
   if (!absolutePath) throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, '无法定位文件，无法解析。');
+  const { extractFileTextInWorker } = await import('./text-extraction.ts');
   return extractFileTextInWorker({ extension: extensionOf(attachment), kind, path: absolutePath, ...selection });
 }
 
@@ -171,7 +170,7 @@ export async function readFileAttachment(input: FileTextSelection & {
         sheet: input.sheet, range: input.range, contentPages: input.contentPages, section: input.section, abortSignal: input.abortSignal,
       }),
       input.includeVisuals && buffer
-        ? renderFilePreview({
+        ? (await import('./office/preview.ts')).renderFilePreview({
             absolutePath: input.absolutePath!,
             buffer,
             extension: extensionOf(resolvedAttachment),
@@ -307,7 +306,7 @@ export async function readFileVisuals(input: {
       return { ok: false, actual: 'file action=visualRead received an invalid screenshotId. Use the exact screenshot-NNNN ids from render.visualIndex or action=visualIndex.' };
     }
 
-    const visuals = await renderFilePreview({
+    const visuals = await (await import('./office/preview.ts')).renderFilePreview({
       absolutePath: input.absolutePath,
       cacheKey: `${request.artifactId}\0${metadata.size}\0${metadata.mtimeMs}`,
       extension: extensionOf(attachment),

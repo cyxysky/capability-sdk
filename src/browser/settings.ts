@@ -1,4 +1,5 @@
 import type { CapabilitySettingDefinition } from '../index.ts';
+export { normalizeBrowserDomainRules } from './access-policy.ts';
 
 const booleanOptions = [
   { label: '开启', value: 'true' },
@@ -6,8 +7,10 @@ const booleanOptions = [
 ] as const;
 
 export const browserCapabilitySettings = [
+  { key: 'BROWSER_DOMAIN_ALLOWLIST', label: '浏览器白名单', description: '留空允许访问所有站点；填写后仅允许名单内的域名。每行一个域名或网址；*.example.com 匹配子域名，example.com 匹配主域名。黑名单优先。仅限制网页导航，不限制页面加载的图片、脚本等资源。', section: 'browser', group: '站点访问规则', defaultValue: '', control: 'textarea', applyMode: 'runtime' },
+  { key: 'BROWSER_DOMAIN_DENYLIST', label: '浏览器黑名单', description: '禁止访问这些站点。支持域名、网址和 *.example.com，每行一项；同时限制地址跳转、链接、新标签页和重定向。保存后对后续导航生效。', section: 'browser', group: '站点访问规则', defaultValue: '', control: 'textarea', applyMode: 'runtime' },
   { key: 'BROWSER_CODE_AUTO_SCREENSHOT', label: '操作后自动截图', description: '每次浏览器代码执行后截取当前视口，供支持图片的模型观察。关闭后不自动截图或附加旧截图；代码主动截图不受影响。', section: 'browser', group: '浏览器观察', defaultValue: 'true', control: 'boolean', applyMode: 'runtime', options: booleanOptions },
-  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览轮询截图并发送的目标帧率。', section: 'browser', group: '实时预览', defaultValue: '20', control: 'number', applyMode: 'runtime', min: 1, max: 60, step: 1 },
+  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览采样与视频编码的固定目标帧率。优先使用浏览器原生帧，无法使用时回退截图。', section: 'browser', group: '实时预览', defaultValue: '30', control: 'number', applyMode: 'runtime', min: 1, max: 60, step: 1 },
   { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '截图输出像素倍率', description: '提高系统截图的输出像素密度，不改变网页 CSS 视口。', section: 'browser', group: '实时预览', defaultValue: '1.5', control: 'number', applyMode: 'runtime', min: 1, max: 2, step: 0.25 },
   { key: 'BROWSER_SCREENCAST_FORMAT', label: '实时预览图片格式', description: 'JPEG 体积较小；PNG 无损但编码和传输开销更高。', section: 'browser', group: '实时预览', defaultValue: 'jpeg', control: 'select', applyMode: 'runtime', options: [{ label: 'JPEG', value: 'jpeg' }, { label: 'PNG', value: 'png' }] },
   { key: 'BROWSER_SCREENCAST_QUALITY', label: '实时预览 JPEG 质量', description: '仅对 JPEG 生效。数值越高画质越好，开销也越高。', section: 'browser', group: '实时预览', defaultValue: '90', control: 'number', applyMode: 'runtime', min: 40, max: 100, step: 1 },
@@ -16,7 +19,7 @@ export const browserCapabilitySettings = [
   { key: 'BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT', label: '视频编码源格式', description: '选择送入 H.264 编码器的源图片格式。', section: 'browser', group: '实时预览', defaultValue: 'jpeg', control: 'select', applyMode: 'runtime', options: [{ label: 'PNG', value: 'png' }, { label: 'JPEG', value: 'jpeg' }] },
   { key: 'BROWSER_PREVIEW_VIDEO_MAX_WIDTH', label: '视频流最大宽度', description: '视频编码宽度上限，只进行等比缩小。', section: 'browser', group: '实时预览', defaultValue: '1920', control: 'number', applyMode: 'runtime', min: 320, max: 4096, step: 2 },
   { key: 'BROWSER_PREVIEW_VIDEO_MAX_HEIGHT', label: '视频流最大高度', description: '视频编码高度上限，只进行等比缩小。', section: 'browser', group: '实时预览', defaultValue: '1080', control: 'number', applyMode: 'runtime', min: 240, max: 2160, step: 2 },
-  { key: 'BROWSER_PREVIEW_VIDEO_KEYFRAME_INTERVAL', label: '视频关键帧间隔', description: 'H.264 关键帧间隔，单位为帧。', section: 'browser', group: '实时预览', defaultValue: '15', control: 'number', applyMode: 'runtime', min: 1, max: 120, step: 1 },
+  { key: 'BROWSER_PREVIEW_VIDEO_KEYFRAME_INTERVAL', label: '视频关键帧间隔', description: 'H.264 关键帧间隔，单位为帧。通常设为目标帧率的一半；过小会增加编码和传输开销。', section: 'browser', group: '实时预览', defaultValue: '15', control: 'number', applyMode: 'runtime', min: 1, max: 120, step: 1 },
   { key: 'BROWSER_PROFILE_CLEAR_CACHE_ON_CLOSE', label: '关闭后清理浏览器缓存', description: '浏览器进程完全关闭后清理缓存并保留登录态及站点数据。', section: 'browser', group: '浏览器实例', defaultValue: 'true', control: 'boolean', applyMode: 'startup', options: booleanOptions },
   { key: 'BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS', label: '用户浏览器空闲回收时间', description: '没有运行中的对话和实时预览后，等待该时长关闭测试浏览器。', section: 'browser', group: '浏览器实例', defaultValue: '180000', control: 'number', applyMode: 'runtime', min: 60000, max: 86400000, step: 60000 },
   { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '桌面端对话使用 Electron 原生浏览器视图。', section: 'browser', group: '浏览器实例', defaultValue: 'false', control: 'boolean', applyMode: 'startup', options: booleanOptions },

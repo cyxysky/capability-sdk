@@ -1,6 +1,6 @@
 'use client';
 
-import { type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, useCallback, useEffect, useLayoutEffect, useId, useRef, useState } from 'react';
+import { type ClipboardEvent as ReactClipboardEvent, type CompositionEvent as ReactCompositionEvent, type CSSProperties, type FormEvent as ReactFormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, memo, useCallback, useEffect, useLayoutEffect, useId, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, Check, Download, Globe, Loader2, Plus, RotateCw, X } from 'lucide-react';
 import { FloatingWindow } from '../../ui/floating-window.tsx';
 import { browserPreviewStyles } from './styles.ts';
@@ -24,12 +24,14 @@ type BrowserPreviewTab = {
 type BrowserPreviewFrame = {
   capturedAt: string;
   contentType: 'image/jpeg' | 'image/png';
-  imageUrl: string;
+  image: Blob;
   sequence?: number;
   tabs: BrowserPreviewTab[];
   url: string;
   viewport: { width: number; height: number };
 };
+
+type BrowserPreviewFrameInfo = Omit<BrowserPreviewFrame, 'image'>;
 
 type BrowserPreviewServerMetrics = {
   activeCaptures?: number;
@@ -54,6 +56,7 @@ type BrowserPreviewServerMetrics = {
 
 type BrowserPreviewDisplayMetrics = BrowserPreviewServerMetrics & {
   displayedFps: number;
+  droppedFps: number;
   receivedFps: number;
 };
 
@@ -74,9 +77,9 @@ type BrowserPreviewInput =
   | { kind: 'browserControl'; action: 'navigate' | 'open' | 'close' | 'back' | 'forward' | 'reload'; url?: string; tabId?: string }
   | { kind: 'clipboard'; action: 'copy' | 'cut' }
   | { kind: 'tab'; tabId: string }
-  | { kind: 'move'; xRatio: number; yRatio: number }
+  | { kind: 'move'; xRatio: number; yRatio: number; gestureId?: string }
+  | { kind: 'pointer'; phase: 'down' | 'up' | 'cancel'; gestureId: string; xRatio: number; yRatio: number; button: 'left' | 'middle'; clickCount: number }
   | { kind: 'click'; xRatio: number; yRatio: number; button: 'left' | 'right' | 'middle'; clickCount: number }
-  | { kind: 'drag'; xRatio: number; yRatio: number; toXRatio: number; toYRatio: number; button: 'left' | 'right' | 'middle' }
   | { kind: 'scroll'; xRatio: number; yRatio: number; deltaX: number; deltaY: number }
   | { kind: 'key'; key: string }
   | { kind: 'text'; text: string }
@@ -142,15 +145,31 @@ type BrowserPreviewDownload = {
   url?: string;
 };
 
-export function BrowserPreviewWindow({ onClose, client, translate: t = identity }: { onClose: () => void; client: BrowserPreviewClient; translate?: (text: string) => string }) {
+type BrowserPreviewWindowProps = {
+  onClose: () => void;
+  client: BrowserPreviewClient;
+  translate?: (text: string) => string;
+};
+
+export function BrowserPreviewWindow({ onClose, ...props }: BrowserPreviewWindowProps) {
+  const onCloseRef = useRef(onClose);
+  useLayoutEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  const closePreview = useCallback(() => onCloseRef.current(), []);
+  return <BrowserPreviewContent {...props} onClose={closePreview} />;
+}
+
+// Chat streaming must not re-render the media pipeline on every parent update.
+const BrowserPreviewContent = memo(function BrowserPreviewContent({ onClose, client, translate: t = identity }: BrowserPreviewWindowProps) {
   const streamRef = useRef<WebSocket | null>(null);
   const reconnectEnabledRef = useRef(true);
   const frameGenerationRef = useRef(0);
   const lastDisplayedAtRef = useRef(Date.now());
   const previewInputReadyRef = useRef(false);
-  const previewImageRef = useRef<HTMLImageElement | null>(null);
+  const previewImageRef = useRef<HTMLCanvasElement | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
+  const previewKeyboardRef = useRef<HTMLTextAreaElement | null>(null);
+  const previewComposingRef = useRef(false);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
   const [addressDraft, setAddressDraft] = useState<string | null>(null);
   const previewFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -163,38 +182,36 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
   const forceImageTransportRef = useRef(false);
   const pumpVideoChunksRef = useRef<() => void>(() => undefined);
   const pendingFrameRef = useRef<BrowserPreviewFrame | null>(null);
-  const frameObjectUrlRef = useRef('');
-  const staleFrameObjectUrlRef = useRef('');
-  const decodingFrameObjectUrlRef = useRef('');
+  const decodedFrameRef = useRef<{ bitmap: ImageBitmap; frame: BrowserPreviewFrameInfo } | null>(null);
+  const framePresentationRef = useRef<number | undefined>(undefined);
   const frameDecodeActiveRef = useRef(false);
   const framePipelineDisposedRef = useRef(false);
   const frameCountersRef = useRef({
     displayed: 0,
     received: 0,
-    sampledAt: Date.now(),
+    sampledAt: performance.now(),
     sampledDisplayed: 0,
     sampledReceived: 0,
   });
+  const serverMetricsRef = useRef<BrowserPreviewServerMetrics | null>(null);
   const frameStateRef = useRef<Pick<BrowserPreviewFrame, 'tabs' | 'url' | 'viewport'>>({
     tabs: [],
     url: '',
     viewport: { height: 720, width: 1280 },
   });
   const pendingMoveRef = useRef<Extract<BrowserPreviewInput, { kind: 'move' }> | null>(null);
+  const lastPointerPressRef = useRef({ at: 0, button: -1, count: 0, x: 0, y: 0 });
   const pointerGestureRef = useRef<{
     button: 'left' | 'middle';
     clickCount: number;
     current: { xRatio: number; yRatio: number };
-    dragged: boolean;
+    gestureId: string;
     pointerId: number;
-    start: { xRatio: number; yRatio: number };
-    startClientX: number;
-    startClientY: number;
   } | null>(null);
   const moveFlushTimerRef = useRef<number | undefined>(undefined);
   const pendingScrollRef = useRef<Extract<BrowserPreviewInput, { kind: 'scroll' }> | null>(null);
   const scrollFlushTimerRef = useRef<number | undefined>(undefined);
-  const [frame, setFrame] = useState<BrowserPreviewFrame | null>(null);
+  const [frame, setFrame] = useState<BrowserPreviewFrameInfo | null>(null);
   const [videoObjectUrl, setVideoObjectUrl] = useState('');
   const [videoDisplayReady, setVideoDisplayReady] = useState(false);
   const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
@@ -308,7 +325,20 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
         }
       }
     }
-    const next = videoChunkQueueRef.current.shift();
+    const queue = videoChunkQueueRef.current;
+    let byteLength = 0;
+    let count = 0;
+    // Append a queued burst together, preserving every dependent H.264 frame.
+    // One append/updateend per frame otherwise amplifies main-thread stalls.
+    while (count < queue.length && (count === 0 || byteLength + queue[count].byteLength <= 256 * 1024)) {
+      byteLength += queue[count].byteLength;
+      count += 1;
+    }
+    const next = count === 1 ? queue.shift() : count ? new Uint8Array(byteLength) : undefined;
+    if (count > 1 && next) {
+      let offset = 0;
+      for (const chunk of queue.splice(0, count)) { next.set(chunk, offset); offset += chunk.byteLength; }
+    }
     if (next) {
       videoQueuedBytesRef.current -= next.byteLength;
       try {
@@ -421,29 +451,57 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
     frameGenerationRef.current += 1;
     // Keep a still of the last decoded video during reconnect/decoder changes.
     const video = previewVideoRef.current;
-    if (preserveDisplayed && video && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+    const canvas = previewImageRef.current;
+    if (preserveDisplayed && canvas && video && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
       try {
-        const canvas = document.createElement('canvas');
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
-        const context = canvas.getContext('2d');
+        const context = canvas.getContext('2d', { alpha: false });
         if (context) {
           context.drawImage(video, 0, 0);
-          const imageUrl = canvas.toDataURL('image/jpeg', 0.9);
-          setFrame({ ...frameStateRef.current, imageUrl, contentType: 'image/jpeg', capturedAt: new Date().toISOString() });
+          setFrame({ ...frameStateRef.current, contentType: 'image/jpeg', capturedAt: new Date().toISOString() });
         }
       } catch { /* Retain the last image frame when video capture is unavailable. */ }
     }
-    for (const url of [preserveDisplayed ? undefined : frameObjectUrlRef.current, staleFrameObjectUrlRef.current, decodingFrameObjectUrlRef.current, pendingFrameRef.current?.imageUrl]) {
-      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
-    }
-    if (!preserveDisplayed) frameObjectUrlRef.current = '';
-    staleFrameObjectUrlRef.current = '';
-    decodingFrameObjectUrlRef.current = '';
+    if (framePresentationRef.current !== undefined) window.cancelAnimationFrame(framePresentationRef.current);
+    framePresentationRef.current = undefined;
+    decodedFrameRef.current?.bitmap.close();
+    decodedFrameRef.current = null;
     pendingFrameRef.current = null;
     frameDecodeActiveRef.current = false;
     lastDisplayedAtRef.current = Date.now();
     if (!preserveDisplayed) setFrame(null);
+  }, []);
+
+  const presentPreviewFrame = useCallback(() => {
+    framePresentationRef.current = undefined;
+    const decoded = decodedFrameRef.current;
+    decodedFrameRef.current = null;
+    if (!decoded) return;
+    try {
+      const canvas = previewImageRef.current;
+      if (!canvas || framePipelineDisposedRef.current) return;
+      const context = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      if (!context) throw new Error('无法创建实时预览画布');
+      if (canvas.width !== decoded.bitmap.width) canvas.width = decoded.bitmap.width;
+      if (canvas.height !== decoded.bitmap.height) canvas.height = decoded.bitmap.height;
+      context.drawImage(decoded.bitmap, 0, 0);
+      frameCountersRef.current.displayed += 1;
+      lastDisplayedAtRef.current = Date.now();
+      previewInputReadyRef.current = true;
+      // Pixels bypass React. Only page/layout metadata changes render the UI.
+      setFrame(current => current && current.url === decoded.frame.url
+        && current.tabs === decoded.frame.tabs
+        && current.viewport.width === decoded.frame.viewport.width
+        && current.viewport.height === decoded.frame.viewport.height
+        ? current : decoded.frame);
+      setStatus('live');
+      setStreamError('');
+    } catch (error) {
+      setStreamError(error instanceof Error ? error.message : '实时画面显示失败');
+    } finally {
+      decoded.bitmap.close();
+    }
   }, []);
 
   const commitPendingPreviewFrame = useCallback(async function commitPendingPreviewFrame() {
@@ -453,51 +511,31 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
     pendingFrameRef.current = null;
     frameDecodeActiveRef.current = true;
     const generation = frameGenerationRef.current;
-    decodingFrameObjectUrlRef.current = nextFrame.imageUrl;
-    let committed = false;
     try {
-      const decodedImage = new Image();
-      decodedImage.decoding = 'async';
-      decodedImage.src = nextFrame.imageUrl;
-      await decodedImage.decode();
-      if (framePipelineDisposedRef.current || generation !== frameGenerationRef.current) return;
-
-      if (staleFrameObjectUrlRef.current.startsWith('blob:')) {
-        URL.revokeObjectURL(staleFrameObjectUrlRef.current);
+      const bitmap = await createImageBitmap(nextFrame.image);
+      if (framePipelineDisposedRef.current || generation !== frameGenerationRef.current) {
+        bitmap.close();
+        return;
       }
-      staleFrameObjectUrlRef.current = frameObjectUrlRef.current;
-      frameObjectUrlRef.current = nextFrame.imageUrl;
-      decodingFrameObjectUrlRef.current = '';
-      committed = true;
-      frameCountersRef.current.displayed += 1;
-      lastDisplayedAtRef.current = Date.now();
-      previewInputReadyRef.current = true;
-      setFrame(nextFrame);
-      setStatus('live');
-      setStreamError('');
+      decodedFrameRef.current?.bitmap.close();
+      const info: BrowserPreviewFrameInfo = {
+        capturedAt: nextFrame.capturedAt, contentType: nextFrame.contentType, sequence: nextFrame.sequence,
+        tabs: nextFrame.tabs, url: nextFrame.url, viewport: nextFrame.viewport,
+      };
+      decodedFrameRef.current = { bitmap, frame: info };
+      if (framePresentationRef.current === undefined) framePresentationRef.current = window.requestAnimationFrame(presentPreviewFrame);
     } catch {
       // A newer frame remains queued and will be decoded below.
     } finally {
-      if (!committed && nextFrame.imageUrl.startsWith('blob:')) {
-        URL.revokeObjectURL(nextFrame.imageUrl);
-      }
-      if (decodingFrameObjectUrlRef.current === nextFrame.imageUrl) {
-        decodingFrameObjectUrlRef.current = '';
-      }
       if (generation === frameGenerationRef.current) {
         frameDecodeActiveRef.current = false;
         if (!framePipelineDisposedRef.current && pendingFrameRef.current) void commitPendingPreviewFrame();
       }
     }
-  }, []);
+  }, [presentPreviewFrame]);
 
   const queuePreviewFrame = useCallback((nextFrame: BrowserPreviewFrame) => {
-    if (framePipelineDisposedRef.current) {
-      if (nextFrame.imageUrl.startsWith('blob:')) URL.revokeObjectURL(nextFrame.imageUrl);
-      return;
-    }
-    const previousPending = pendingFrameRef.current?.imageUrl;
-    if (previousPending?.startsWith('blob:')) URL.revokeObjectURL(previousPending);
+    if (framePipelineDisposedRef.current) return;
     pendingFrameRef.current = nextFrame;
     void commitPendingPreviewFrame();
   }, [commitPendingPreviewFrame]);
@@ -514,6 +552,9 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
     clearPreviewFrames();
     const disconnect = () => {
       previewInputReadyRef.current = false;
+      pointerGestureRef.current = null;
+      pendingMoveRef.current = null;
+      lastPointerPressRef.current.at = 0;
       connectionId += 1;
       requestController?.abort();
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
@@ -558,11 +599,12 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
           if (!isCurrent()) return;
           lastMessageAt = Date.now();
           const counters = frameCountersRef.current;
-          counters.sampledAt = Date.now();
+          counters.sampledAt = performance.now();
           counters.sampledDisplayed = counters.displayed;
           counters.sampledReceived = counters.received;
           frameStateRef.current = { tabs: [], url: '', viewport: { height: 720, width: 1280 } };
           setPreviewMetrics(null);
+          serverMetricsRef.current = null;
           setStatus('connecting');
           setStreamError('');
         };
@@ -598,20 +640,20 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
                 throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Unknown binary preview payload');
               }
               frameCountersRef.current.received += 1;
-              const imageUrl = URL.createObjectURL(new Blob(
+              const image = new Blob(
                 [payload],
                 { type: metadata.contentType },
-              ));
+              );
               queuePreviewFrame({
                 ...frameStateRef.current,
                 capturedAt: metadata.capturedAt || new Date().toISOString(),
                 contentType: metadata.contentType,
-                imageUrl,
+                image,
                 sequence: metadata.sequence,
               });
               return;
             }
-            const message = JSON.parse(String(event.data)) as BrowserPreviewFrame & {
+            const message = JSON.parse(String(event.data)) as BrowserPreviewFrameInfo & {
               error?: string;
               height?: number;
               metrics?: BrowserPreviewServerMetrics;
@@ -636,17 +678,7 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
               frameStateRef.current = { ...frameStateRef.current, viewport: message.viewport };
               setFrame((current) => current ? { ...current, viewport: message.viewport } : current);
             } else if (message.type === 'frameHeartbeat' && message.metrics) {
-              const counters = frameCountersRef.current;
-              const sampledAt = Date.now();
-              const sampleSeconds = Math.max(0.001, (sampledAt - counters.sampledAt) / 1_000);
-              setPreviewMetrics({
-                ...message.metrics,
-                displayedFps: (counters.displayed - counters.sampledDisplayed) / sampleSeconds,
-                receivedFps: (counters.received - counters.sampledReceived) / sampleSeconds,
-              });
-              counters.sampledAt = sampledAt;
-              counters.sampledDisplayed = counters.displayed;
-              counters.sampledReceived = counters.received;
+              serverMetricsRef.current = message.metrics;
             } else if (message.type === 'transportChanged' && message.transport) {
               if (message.transport === 'image') {
                 forceImageTransportRef.current = true;
@@ -760,14 +792,10 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
       framePipelineDisposedRef.current = true;
       frameGenerationRef.current += 1;
       frameDecodeActiveRef.current = false;
-      if (frameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(frameObjectUrlRef.current);
-      if (staleFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(staleFrameObjectUrlRef.current);
-      if (decodingFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(decodingFrameObjectUrlRef.current);
-      const pendingUrl = pendingFrameRef.current?.imageUrl;
-      if (pendingUrl?.startsWith('blob:')) URL.revokeObjectURL(pendingUrl);
-      frameObjectUrlRef.current = '';
-      staleFrameObjectUrlRef.current = '';
-      decodingFrameObjectUrlRef.current = '';
+      if (framePresentationRef.current !== undefined) window.cancelAnimationFrame(framePresentationRef.current);
+      framePresentationRef.current = undefined;
+      decodedFrameRef.current?.bitmap.close();
+      decodedFrameRef.current = null;
       pendingFrameRef.current = null;
       pendingMoveRef.current = null;
       pointerGestureRef.current = null;
@@ -778,40 +806,70 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
   }, [disposeVideoPipeline]);
 
   useEffect(() => {
+    let sampledVideoSource = '';
+    let sampledVideoFrames = 0;
+    let sampledDroppedFrames = 0;
+    const sample = () => {
+      const metrics = serverMetricsRef.current;
+      if (!metrics) return;
+      const counters = frameCountersRef.current;
+      const sampledAt = performance.now();
+      const sampleSeconds = Math.max(0.001, (sampledAt - counters.sampledAt) / 1_000);
+      const video = previewVideoRef.current;
+      const videoSource = videoObjectUrlRef.current;
+      let droppedFrames = 0;
+      if (videoSource && video && video.readyState >= 2) {
+        const quality = video.getVideoPlaybackQuality();
+        const presented = Math.max(0, quality.totalVideoFrames - quality.droppedVideoFrames);
+        const delta = Math.max(0, presented - (videoSource === sampledVideoSource ? sampledVideoFrames : 0));
+        droppedFrames = Math.max(0, quality.droppedVideoFrames - (videoSource === sampledVideoSource ? sampledDroppedFrames : 0));
+        counters.displayed += delta;
+        if (delta) lastDisplayedAtRef.current = Date.now();
+        sampledVideoSource = videoSource;
+        sampledVideoFrames = presented;
+        sampledDroppedFrames = quality.droppedVideoFrames;
+      } else {
+        sampledVideoSource = '';
+        sampledVideoFrames = 0;
+        sampledDroppedFrames = 0;
+      }
+      setPreviewMetrics({
+        ...metrics,
+        displayedFps: (counters.displayed - counters.sampledDisplayed) / sampleSeconds,
+        droppedFps: droppedFrames / sampleSeconds,
+        receivedFps: (counters.received - counters.sampledReceived) / sampleSeconds,
+      });
+      counters.sampledAt = sampledAt;
+      counters.sampledDisplayed = counters.displayed;
+      counters.sampledReceived = counters.received;
+    };
+    const timer = window.setInterval(sample, 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     const video = previewVideoRef.current;
     if (!videoObjectUrl || !video) return undefined;
     let stopped = false;
-    let callbackId = 0;
-    let presentedFrames = 0;
     const markLive = () => {
       if (stopped) return;
+      previewInputReadyRef.current = true;
+      lastDisplayedAtRef.current = Date.now();
       setStatus('live');
       setStreamError('');
     };
-    const frameCallback = (_now: number, metadata: VideoFrameCallbackMetadata) => {
-      if (stopped) return;
-      // Count frames presented by the compositor, not callbacks serviced by
-      // React's main thread; callbacks can be delayed while the chat renders.
-      frameCountersRef.current.displayed += Math.max(0, metadata.presentedFrames - presentedFrames);
-      presentedFrames = metadata.presentedFrames;
-      lastDisplayedAtRef.current = Date.now();
-      previewInputReadyRef.current = true;
-      markLive();
-      callbackId = video.requestVideoFrameCallback(frameCallback);
-    };
     video.addEventListener('playing', markLive);
-    callbackId = video.requestVideoFrameCallback(frameCallback);
     void video.play().catch(() => undefined);
     return () => {
       stopped = true;
       video.removeEventListener('playing', markLive);
-      if (callbackId) video.cancelVideoFrameCallback(callbackId);
     };
   }, [videoObjectUrl]);
 
   const postInput = useCallback((input: BrowserPreviewInput, reportError: boolean) => {
     const stream = streamRef.current;
-    if (!stream || stream.readyState !== WebSocket.OPEN || (!previewInputReadyRef.current && input.kind !== 'tab' && input.kind !== 'browserControl')) {
+    const releasingPointer = input.kind === 'pointer' && input.phase !== 'down';
+    if (!stream || stream.readyState !== WebSocket.OPEN || (!previewInputReadyRef.current && !releasingPointer && input.kind !== 'tab' && input.kind !== 'browserControl')) {
       if (reportError) setInputError('实时界面正在重连，请稍后重试');
       return false;
     }
@@ -848,7 +906,6 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
   }, [addressDraft, sendInput]);
 
   const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
-    if (!frame?.imageUrl && !videoDisplayReady) return undefined;
     if (!frame) return undefined;
     const mediaRect = previewVideoRef.current?.getBoundingClientRect()
       || previewImageRef.current?.getBoundingClientRect()
@@ -878,41 +935,49 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
       xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
       yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height)),
     };
-  }, [frame, videoDisplayReady]);
+  }, [frame]);
 
   const beginPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
     if (event.button !== 0 && event.button !== 1) return;
+    if (pointerGestureRef.current) return;
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
     if (!point) return;
+    pendingMoveRef.current = null;
+    const previous = lastPointerPressRef.current;
+    const at = performance.now();
+    const clickCount = Math.min(2, Math.max(1, event.detail || (
+      at - previous.at < 500 && previous.button === event.button
+        && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) < 4
+        ? previous.count % 2 + 1 : 1
+    )));
+    lastPointerPressRef.current = { at, button: event.button, count: clickCount, x: event.clientX, y: event.clientY };
+    const gesture = {
+      button: event.button === 1 ? 'middle' as const : 'left' as const,
+      clickCount,
+      current: point,
+      gestureId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+      pointerId: event.pointerId,
+    };
+    if (!sendInput({ kind: 'pointer', phase: 'down', ...point, button: gesture.button, clickCount: gesture.clickCount, gestureId: gesture.gestureId })) return;
+    pointerGestureRef.current = gesture;
     setNativeControl(null);
     event.currentTarget.focus();
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
-    pointerGestureRef.current = {
-      button: event.button === 1 ? 'middle' : 'left',
-      clickCount: Math.min(2, Math.max(1, event.detail || 1)),
-      current: point,
-      dragged: false,
-      pointerId: event.pointerId,
-      start: point,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-    };
-  }, [relativePoint]);
+  }, [relativePoint, sendInput]);
 
   const movePreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = pointerGestureRef.current;
+    if (gesture && gesture.pointerId !== event.pointerId) return;
+    if (!gesture && event.target !== event.currentTarget) return;
     if (!gesture && event.pointerType === 'touch') return;
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget, Boolean(gesture));
     if (!point) return;
     if (gesture && gesture.pointerId === event.pointerId) {
       gesture.current = point;
-      if (Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) >= 4) {
-        gesture.dragged = true;
-      }
-      return;
     }
-    pendingMoveRef.current = { kind: 'move', ...point };
+    pendingMoveRef.current = { kind: 'move', ...point, ...(gesture ? { gestureId: gesture.gestureId } : {}) };
     if (moveFlushTimerRef.current !== undefined) return;
     moveFlushTimerRef.current = window.setTimeout(() => {
       moveFlushTimerRef.current = undefined;
@@ -926,38 +991,51 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
     const gesture = pointerGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget, true) || gesture.current;
+    // Preserve the last queued move before the release, even within one frame.
+    const pendingMove = pendingMoveRef.current;
+    pendingMoveRef.current = null;
+    if (pendingMove) postInput(pendingMove, false);
     pointerGestureRef.current = null;
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
       event.currentTarget.releasePointerCapture?.(event.pointerId);
     }
     event.preventDefault();
-    if (gesture.dragged) {
-      sendInput({
-        kind: 'drag',
-        ...gesture.start,
-        toXRatio: point.xRatio,
-        toYRatio: point.yRatio,
-        button: gesture.button,
-      });
-      return;
-    }
     sendInput({
-      kind: 'click',
+      kind: 'pointer',
+      phase: 'up',
+      gestureId: gesture.gestureId,
       ...point,
       button: gesture.button,
       clickCount: gesture.clickCount,
     });
-  }, [relativePoint, sendInput]);
+  }, [postInput, relativePoint, sendInput]);
+
+  const releasePreviewPointer = useCallback(() => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture) return;
+    pointerGestureRef.current = null;
+    pendingMoveRef.current = null;
+    postInput({ kind: 'pointer', phase: 'cancel', ...gesture.current, button: gesture.button, clickCount: gesture.clickCount, gestureId: gesture.gestureId }, false);
+  }, [postInput]);
 
   const cancelPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (pointerGestureRef.current?.pointerId !== event.pointerId) return;
-    pointerGestureRef.current = null;
+    releasePreviewPointer();
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
       event.currentTarget.releasePointerCapture?.(event.pointerId);
     }
-  }, []);
+  }, [releasePreviewPointer]);
+
+  useEffect(() => {
+    window.addEventListener('blur', releasePreviewPointer);
+    return () => {
+      window.removeEventListener('blur', releasePreviewPointer);
+      releasePreviewPointer();
+    };
+  }, [releasePreviewPointer]);
 
   const openPreviewContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
     const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
     if (!point) return;
     event.preventDefault();
@@ -986,9 +1064,13 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
   }, [relativePoint, sendInput]);
 
   const pressPreviewKey = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.nativeEvent.isComposing || event.key === 'Process') return;
+    if (event.target !== event.currentTarget && event.target !== previewKeyboardRef.current) return;
+    event.stopPropagation();
+    if (previewComposingRef.current || event.nativeEvent.isComposing || event.keyCode === 229
+      || ['Process', 'Dead', 'Unidentified'].includes(event.key)) return;
     if (['Control', 'Meta', 'Alt', 'Shift'].includes(event.key)) return;
-    const command = event.ctrlKey || event.metaKey;
+    const altGraph = event.getModifierState('AltGraph');
+    const command = !altGraph && (event.ctrlKey || event.metaKey);
     const letter = event.key.toLowerCase();
     // Let the local browser dispatch paste, then relay its clipboard text once.
     if ((command && letter === 'v') || (event.shiftKey && event.key === 'Insert')) {
@@ -1019,7 +1101,10 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
       setNativeControl(null);
       return;
     }
-    const modifierShortcut = event.ctrlKey || event.metaKey || event.altKey;
+    const modifierShortcut = !altGraph && (event.ctrlKey || event.metaKey || event.altKey);
+    // Native input receives printable characters, dead keys and IME commits.
+    // Non-text keys and shortcuts still use the remote keyboard directly.
+    if (!modifierShortcut && Array.from(event.key).length === 1) return;
     let key = event.key;
     if (modifierShortcut) {
       const parts = [
@@ -1040,7 +1125,42 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
     sendInput({ kind: 'key', key });
   }, [browserControl, nativeControl, sendInput]);
 
+  const inputPreviewText = useCallback((event: ReactFormEvent<HTMLTextAreaElement>) => {
+    event.stopPropagation();
+    if (previewComposingRef.current || (event.nativeEvent as InputEvent).isComposing) return;
+    const text = event.currentTarget.value;
+    event.currentTarget.value = '';
+    if (!text) return;
+    // Preserve keyboard events for ordinary typing; composed and Unicode text
+    // use the text channel because they need not correspond to a physical key.
+    if (text.length === 1 && text >= ' ' && text <= '~') {
+      sendInput({ kind: 'key', key: text === ' ' ? 'Space' : text });
+    } else {
+      sendInput({ kind: 'text', text });
+    }
+  }, [sendInput]);
+
+  const startPreviewComposition = useCallback((event: ReactCompositionEvent<HTMLTextAreaElement>) => {
+    event.stopPropagation();
+    previewComposingRef.current = true;
+  }, []);
+
+  const endPreviewComposition = useCallback((event: ReactCompositionEvent<HTMLTextAreaElement>) => {
+    event.stopPropagation();
+    const input = event.currentTarget;
+    const committedText = event.data;
+    // Browsers can deliver the final input before or after compositionend in
+    // the same task. Drain both events before clearing and forwarding once.
+    queueMicrotask(() => {
+      const text = input.value || committedText;
+      input.value = '';
+      previewComposingRef.current = false;
+      if (text) sendInput({ kind: 'text', text });
+    });
+  }, [sendInput]);
+
   const pastePreviewText = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget && event.target !== previewKeyboardRef.current) return;
     event.stopPropagation();
     const text = event.clipboardData.getData('text');
     if (!text) return;
@@ -1133,7 +1253,7 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
   const statusLabel = t(statusLabelSource);
   const previewMetricsLabel = status === 'unavailable' ? t('未运行')
     : status !== 'live' ? statusLabel : previewMetrics ? `${previewMetrics.displayedFps.toFixed(1)} FPS` : '';
-  const hasPreviewVisual = videoDisplayReady || Boolean(frame?.imageUrl);
+  const hasPreviewVisual = videoDisplayReady || Boolean(frame);
 
   return (
     <FloatingWindow title={t('实时界面')} className="cap-browser-preview-modal" onClose={onClose}>
@@ -1183,7 +1303,11 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
                 }} />
               <kbd className="cap-browser-preview-address-hint" aria-hidden="true">↵</kbd>
           </form>
-          <span className="cap-browser-preview-metrics" data-status={status} title={statusLabel} role="status">
+          <span className="cap-browser-preview-metrics" data-status={status}
+            data-displayed-fps={previewMetrics?.displayedFps} data-received-fps={previewMetrics?.receivedFps}
+            data-send-fps={previewMetrics?.sendFps} data-capture-fps={previewMetrics?.captureFps}
+            data-dropped-fps={previewMetrics?.droppedFps} data-target-fps={previewMetrics?.targetFps}
+            title={previewMetrics ? `${t('显示')} ${previewMetrics.displayedFps.toFixed(1)} FPS · ${t('接收')} ${previewMetrics.receivedFps.toFixed(1)} FPS · ${t('发送')} ${(previewMetrics.sendFps || 0).toFixed(1)} FPS · ${t('丢帧')} ${(previewMetrics.droppedFps || 0).toFixed(1)} FPS` : statusLabel} role="status">
             {status === 'connecting' || status === 'reconnecting'
               ? <Loader2 className="cap-browser-preview-connection-spinner" size={11} aria-hidden="true" />
               : <i aria-hidden="true" />}
@@ -1198,9 +1322,13 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
             aria-label={t('可操作的浏览器实时画面')}
             className={hasPreviewVisual ? 'cap-browser-preview-stage has-frame' : 'cap-browser-preview-stage'}
             onContextMenu={openPreviewContextMenu}
+            onFocus={event => {
+              if (event.target === event.currentTarget) previewKeyboardRef.current?.focus({ preventScroll: true });
+            }}
             onKeyDown={pressPreviewKey}
             onPaste={pastePreviewText}
             onPointerCancel={cancelPreviewPointer}
+            onLostPointerCapture={cancelPreviewPointer}
             onPointerDown={beginPreviewPointer}
             onPointerMove={movePreviewPointer}
             onPointerUp={endPreviewPointer}
@@ -1209,16 +1337,19 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
             role="application"
             tabIndex={0}
           >
-            {frame?.imageUrl && !videoDisplayReady ? (
-              <img
-                alt={t('浏览器实时画面')}
-                draggable={false}
-                height={frame.viewport.height}
-                ref={previewImageRef}
-                src={frame.imageUrl}
-                width={frame.viewport.width}
-              />
-            ) : null}
+            <textarea
+              aria-label={t('浏览器键盘输入')}
+              autoCapitalize="off"
+              autoComplete="off"
+              className="cap-browser-preview-keyboard-input"
+              onCompositionEnd={endPreviewComposition}
+              onCompositionStart={startPreviewComposition}
+              onInput={inputPreviewText}
+              ref={previewKeyboardRef}
+              spellCheck={false}
+              tabIndex={-1}
+            />
+            <canvas aria-label={t('浏览器实时画面')} ref={previewImageRef} role="img" />
             {videoObjectUrl ? (
               <video
                 autoPlay
@@ -1347,7 +1478,7 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
             ) : null}
             {!hasPreviewVisual ? (
               <div className="cap-browser-preview-empty">
-                <Loader2 className="spin" size={22} />
+                {status === 'unavailable' ? <Globe size={22} /> : <Loader2 className="spin" size={22} />}
                 <strong>{streamError ? t(streamError) : t('正在等待浏览器画面')}</strong>
                 <span>{t('输入网址或点击“新增标签页”启动浏览器，也可以让 AI 打开网页。')}</span>
               </div>
@@ -1379,5 +1510,5 @@ export function BrowserPreviewWindow({ onClose, client, translate: t = identity 
 
     </FloatingWindow>
   );
-}
+});
 

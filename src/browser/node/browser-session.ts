@@ -1,6 +1,6 @@
 import { browserExecutionErrorCode } from "../../errors.ts";
 import sharp from 'sharp';
-import { readManagedRuntime } from '../../runtime.ts';
+import { managedChromiumOptions } from '../../runtime.ts';
 import { acquireSharedBrowser, connectOrLaunchPersistentBrowserOverCdp, launchPersistentContextWithBrowserCodeConnection, connectExistingBrowserOverCdp, launchBrowserServerWithConnection, sleep, closeConnectedBrowserProcess, type BrowserOwnership } from './browser-shared-runtime.ts';
 import { BrowserDownloadManager, type BrowserDownloadReceiver, type BrowserDownloadResult } from './browser-downloads.ts';
 import { BrowserStateReader, type BrowserStateReadOptions } from './browser-state-reader.ts';
@@ -16,6 +16,8 @@ import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, Con
 import { raceWithAbort, type CapabilityConfiguration } from '../../index.ts';
 import { resolveBrowserOutputPixelRatio, resolveBrowserPreviewImageFormat } from '../output-settings.ts';
 import { browserSessionGroupLabel } from '../session-group.ts';
+import { browserNavigationAllowed } from '../access-policy.ts';
+import { ensureBrowserRedirectPolicy } from './browser-access-policy.ts';
 import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence.ts';
 import { BrowserPreviewFramePump, type BrowserPreviewFramePumpMetrics } from './browser-preview-frame-pump.ts';
 import { browserPreviewVideoMaximumDimensions } from './browser-preview-video-settings.ts';
@@ -65,6 +67,9 @@ export type BrowserSessionOptions = {
   runId?: string;
   /** Durable browserCode state scope shared by all kernels for one browser conversation. */
   browserCodeStateSessionId?: string;
+  /** Attach to one host-owned Chromium target without claiming unrelated tabs. */
+  attachTargetId?: string;
+  sessionGroupId?: string;
   preferExistingPage?: boolean;
   browserProfileKey?: string;
   debugDevtools?: boolean;
@@ -81,8 +86,10 @@ export type BrowserSessionOptions = {
   actionFrameLimit?: number;
   /** Host-owned artifact storage and optional durable browserCode state. */
   host?: BrowserSessionHost;
-  /** Per-runtime settings loaded by the Capability host; values override process.env. */
+  /** Per-runtime settings supplied by the capability host. */
   configuration?: CapabilityConfiguration;
+  /** Standalone clients may inherit environment settings; application hosts can disable it. */
+  inheritEnvironment?: boolean;
 };
 
 export type BrowserSessionHost = {
@@ -613,6 +620,7 @@ type AiDomRuntime = {
   hasActionAttribute: (element: Element) => boolean;
   hasPointerCursor: (element: Element) => boolean;
   isContentEditableOwner: (element: Element) => boolean;
+  isDisabledElement: (element: Element) => boolean;
   labelControlFor: (element: Element) => Element | undefined;
   visibleDomHoverElements: () => Set<Element>;
   isActionable: (element: Element) => boolean;
@@ -649,6 +657,7 @@ type AiDomRuntime = {
     coveredBy?: string;
   } | undefined);
   visibleDomElement: (ref: string) => Element | undefined;
+  visibleDomSelector: (ref: string) => string | undefined;
   visibleDomText: (ref: string, options?: { maxChars?: number }) => ({ descriptor: string; text: string; textLength: number } | undefined);
   selectVisibleDomOption: (ref: string, input: { value?: string; label?: string }) => ({
     ok: boolean;
@@ -796,6 +805,16 @@ export type BrowserLiveInput =
       kind: 'move';
       xRatio: number;
       yRatio: number;
+      gestureId?: string;
+    }
+  | {
+      kind: 'pointer';
+      phase: 'down' | 'up' | 'cancel';
+      gestureId: string;
+      xRatio: number;
+      yRatio: number;
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
     }
   | {
       kind: 'click';
@@ -958,6 +977,9 @@ export type WindowWithAiDomRuntime = Window & {
   __aiDomRuntime?: AiDomRuntime;
   __aiDomMutationState?: AiDomMutationStateSnapshot & {
     observer?: MutationObserver;
+    observerVersion?: number;
+    mutationReleaseTimer?: number;
+    releaseOnHidden?: () => void;
     pendingMutations?: MutationRecord[];
     pendingMutationKeys?: WeakMap<Node, Set<string>>;
     pendingOverflow?: boolean;
@@ -1031,6 +1053,7 @@ export type BrowserTabRestoreResult = {
 };
 
 export type BrowserScreencastFrame = {
+  framesPerSecond: number;
   /** Encoded JPEG/PNG bytes; preview transports must not base64 round-trip them. */
   data: Buffer;
   contentType: 'image/jpeg' | 'image/png';
@@ -1068,6 +1091,36 @@ type NativeTabGroupActivation = {
 };
 
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
+const accessPolicyContexts = new WeakMap<BrowserContext, Parameters<BrowserContext['route']>[1]>();
+const contextAccessPolicyConfigurations = new WeakMap<BrowserContext, CapabilityConfiguration>();
+const pageAccessPolicyReaders = new WeakMap<Page, () => BrowserRuntimeEnvironment>();
+const navigationResponseGuards = new WeakMap<Page, Promise<void>>();
+const navigationResponseGuardDisposers = new WeakMap<Page, () => void>();
+
+function guardNavigationRedirects(context: BrowserContext, page: Page, fallback: () => BrowserRuntimeEnvironment, endpoint: string) {
+  let pending = navigationResponseGuards.get(page);
+  if (pending) return pending;
+  pending = (async () => {
+    const session = await context.newCDPSession(page);
+    let release: (() => void) | undefined;
+    try {
+      const { targetInfo } = await session.send('Target.getTargetInfo');
+      const browser = context.browser();
+      if (!browser) throw new Error('Browser policy requires a CDP browser connection');
+      release = await ensureBrowserRedirectPolicy(browser, endpoint, targetInfo.targetId, () => (pageAccessPolicyReaders.get(page) || fallback)());
+    } finally { await session.detach().catch(() => undefined); }
+    const dispose = () => {
+      page.off('close', dispose);
+      navigationResponseGuards.delete(page);
+      navigationResponseGuardDisposers.delete(page);
+      release?.();
+    };
+    navigationResponseGuardDisposers.set(page, dispose);
+    page.once('close', dispose);
+  })().catch(error => { navigationResponseGuards.delete(page); throw error; });
+  navigationResponseGuards.set(page, pending);
+  return pending;
+}
 const sharedPageOwners = new WeakMap<Page, string>();
 const livePreviewVisibilityRuntime = ((globalThis as typeof globalThis & {
   __webPilotLivePreviewVisibilityRuntime?: {
@@ -1353,7 +1406,7 @@ export class BrowserSession {
       }
       await this.refreshSessionGroupPages({ forceNativeRefresh: true });
       const result = () => ({ operation, url: this.page && !this.page.isClosed() ? this.page.url() : '', tabs: this.getTabsSnapshot(), businessOutcome: 'unverified' });
-      if (operation === 'list') return { ok: true, actual: JSON.stringify(result()) };
+      if (operation === 'list') return { ok: true, summary: 'Listed current browser tabs.', data: result() };
       let target: Page | undefined;
       if (operation === 'select' || operation === 'close') {
         target = this.sessionPages().find(page => this.livePreviewTabId(page) === input.tabId);
@@ -1386,7 +1439,8 @@ export class BrowserSession {
         }
         signal.throwIfAborted();
         this.notifyLivePreviewTabsChanged();
-        return { ok: true, actual: JSON.stringify({ ...result(), next: 'Read a fresh observation/state and verify the destination before dependent page actions.' }) };
+        return { ok: true, summary: `Browser control ${operation} returned; verify the current destination before dependent page actions.`,
+          data: { ...result(), next: 'Read a fresh observation/state and verify the destination before dependent page actions.' } };
       } catch (error) {
         return { ok: false, failureCategory: ERROR_CODES.EXECUTION_UNCERTAIN,
           actual: 'Browser control outcome is uncertain. Inspect current tabs and observation; do not repeat automatically.',
@@ -1553,6 +1607,7 @@ export class BrowserSession {
   }
 
   private ownedPages = new Set<Page>();
+  private automationObserver?: Browser;
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: (force?: boolean) => Promise<void>;
   private parentBrowserSession?: BrowserSession;
@@ -1561,6 +1616,18 @@ export class BrowserSession {
   private livePreviewStateListeners = new Set<BrowserLivePreviewStateListener>();
   private livePreviewNativeListeners = new Set<(event: BrowserLiveNativeEvent) => void>();
   private activeScreencasts = new Set<BrowserScreencastHandle>();
+  private livePreviewPointer?: {
+    button: 'left' | 'right' | 'middle';
+    clickCount: number;
+    gestureId: string;
+    page: Page;
+    pressed: boolean;
+    startX: number;
+    startY: number;
+    moved: boolean;
+    download?: { fileName: string; url: string };
+  };
+  private livePreviewPopupWatchCounts = new WeakMap<Page, number>();
   private liveDialogOpenedWaiters = new Set<(page: Page) => void>();
   private pendingLiveDialogs = new Map<string, { descriptor: BrowserLiveDialog; dialog: Dialog; page: Page }>();
   private pendingLiveFileInputs = new Map<string, { element: ElementHandle<HTMLInputElement>; page: Page }>();
@@ -1604,7 +1671,7 @@ export class BrowserSession {
 
   constructor(private readonly options: BrowserSessionOptions = {}) {
     this.capabilityConfiguration = Object.freeze({ ...options.configuration });
-    this.pageGroupId = normalizePageGroupId(options.runId);
+    this.pageGroupId = normalizePageGroupId(options.sessionGroupId || options.runId);
   }
 
   /** Applies host-loaded settings before a lazily created session is started. */
@@ -1614,6 +1681,7 @@ export class BrowserSession {
       ...this.capabilityConfiguration,
       ...configuration,
     });
+    if (this.context) contextAccessPolicyConfigurations.set(this.context, this.capabilityConfiguration);
     if (!this.automaticBrowserScreenshotEnabled()) {
       this.latestBrowserObservation = undefined;
       this.browserViewportEvidence = undefined;
@@ -1622,11 +1690,11 @@ export class BrowserSession {
   }
 
   private runtimeEnvironment(): BrowserRuntimeEnvironment {
-    return { ...process.env, ...this.capabilityConfiguration };
+    return { ...(this.options.inheritEnvironment === false ? {} : process.env), ...this.capabilityConfiguration };
   }
 
   private configuredValue(key: string) {
-    return this.capabilityConfiguration[key] ?? process.env[key];
+    return this.capabilityConfiguration[key] ?? (this.options.inheritEnvironment === false ? undefined : process.env[key]);
   }
 
   private snapshotFrameConcurrency() {
@@ -1661,6 +1729,78 @@ export class BrowserSession {
   browserAutomationConnection(): BrowserCodeConnection {
     if (!this.browserCodeConnection || !this.isUsable()) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Browser session is not ready for an external automation transport.');
     return { ...this.browserCodeConnection };
+  }
+
+  async browserAutomationTarget() {
+    const page = this.activePage;
+    const connection = await page.context().newCDPSession(page);
+    try {
+      const { targetInfo } = await connection.send('Target.getTargetInfo');
+      return { ...this.browserAutomationConnection(), targetId: targetInfo.targetId, sessionGroupId: this.pageGroupId };
+    } finally { await connection.detach().catch(() => undefined); }
+  }
+
+  async selectAutomationTarget(targetId: string) {
+    for (const candidateContext of new Set([this.context, ...(this.browser?.contexts() || [])])) for (const page of candidateContext?.pages() || []) {
+      const context = page.context();
+      const connection = await context.newCDPSession(page).catch(() => undefined);
+      if (!connection) continue;
+      let id: string | undefined;
+      try { id = (await connection.send('Target.getTargetInfo')).targetInfo.targetId; }
+      finally { await connection.detach().catch(() => undefined); }
+      if (id !== targetId) continue;
+      const group = await page.evaluate(() => document.documentElement?.getAttribute('data-ai-web-test-session-group-id')
+        || String(window.name || '').match(/^AI_WEB_TEST_SESSION_GROUP:([^;]+)/)?.[1] || '').catch(() => '');
+      if (group !== this.pageGroupId) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Browser target belongs to another session.');
+      await this.prepareContext(context, { claimPages: false });
+      this.context = context; this.installOwnedPageDiscovery(context);
+      this.claimPage(page, { allowSteal: true }); this.page = page;
+      await this.ensurePageGroup(page);
+      return;
+    }
+    // A Playwright server connection may not publish pages created by another
+    // client. Refresh its snapshot and rebind this session's pages by Chromium
+    // target id. Keep one observer connection and preserve public tab ids.
+    if (this.browserCodeConnection) {
+      const { chromium } = await import('patchright');
+      const connection = this.browserCodeConnection;
+      const observer = connection.protocol === 'playwright' ? await chromium.connect(connection.endpoint) : await chromium.connectOverCDP(connection.endpoint);
+      try {
+        const targets = new Map<string, Page>();
+        for (const context of observer.contexts()) for (const page of context.pages()) {
+          const channel = await context.newCDPSession(page);
+          try { targets.set((await channel.send('Target.getTargetInfo')).targetInfo.targetId, page); }
+          finally { await channel.detach().catch(() => undefined); }
+        }
+        const selected = targets.get(targetId);
+        if (!selected) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The attached browser target is no longer available.');
+        const groupOf = (page: Page) => page.evaluate(() => document.documentElement?.getAttribute('data-ai-web-test-session-group-id')
+          || String(window.name || '').match(/^AI_WEB_TEST_SESSION_GROUP:([^;]+)/)?.[1] || '').catch(() => '');
+        if (await groupOf(selected) !== this.pageGroupId) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Browser target belongs to another session.');
+        const ids = new Map<string, string>();
+        for (const page of this.sessionPages()) {
+          const id = await this.browserCodeTargetId(page).catch(() => undefined);
+          if (id) ids.set(id, this.livePreviewTabId(page));
+        }
+        if (this.context && this.contextPageListener) this.context.off('page', this.contextPageListener);
+        if (this.context && this.pageDiscoveryListener) this.context.off('page', this.pageDiscoveryListener);
+        this.contextPageListener = undefined; this.pageDiscoveryListener = undefined;
+        for (const page of this.ownedPages) this.detachPageListeners(page);
+        this.ownedPages.clear();
+        const context = selected.context();
+        await this.prepareContext(context, { claimPages: false });
+        this.context = context; this.installOwnedPageDiscovery(context);
+        for (const [id, page] of targets) if (page.context() === context && await groupOf(page) === this.pageGroupId) {
+          if (ids.has(id)) this.livePreviewTabIds.set(page, ids.get(id)!);
+          this.claimPage(page, { allowSteal: true, makeActive: false });
+        }
+        this.page = selected;
+        const previous = this.automationObserver; this.automationObserver = observer;
+        await previous?.close().catch(() => undefined);
+        return;
+      } catch (error) { await observer.close().catch(() => undefined); throw error; }
+    }
+    throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The attached browser target is no longer available.');
   }
 
   async focusActivePage() {
@@ -1737,6 +1877,7 @@ export class BrowserSession {
       slowMoMs: options.slowMoMs,
       host: this.options.host,
       configuration: this.capabilityConfiguration,
+      inheritEnvironment: this.options.inheritEnvironment,
     });
     child.browserSurface = this.browserSurface;
     child.transportKind = this.transportKind;
@@ -1806,13 +1947,14 @@ export class BrowserSession {
     // can tear down the browser that the earlier caller has just started.
     const attempt = Promise.resolve().then(async () => {
       await pendingClose;
-      if (this.lifecycle === 'ready' && this.isUsable()) return;
+      if (this.lifecycle === 'ready' && this.isUsable()) { await this.prepareNavigationPolicy(); return; }
       // A missing tab does not mean the shared browser process is dead. Release
       // this session's lease without terminating other conversations' pages.
       if (this.lifecycle === 'ready') await this.closeNow({ preservePages: true });
       this.lifecycle = 'starting';
       try {
         await this.startNow();
+        await this.prepareNavigationPolicy();
         if (!this.isUsable()) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Browser startup completed without an owned, open page.');
         // Reclaimed tabs may arrive without an active-page selection.
         void this.activePage;
@@ -1833,6 +1975,18 @@ export class BrowserSession {
 
   async ensureStarted() {
     await this.start();
+  }
+
+  private async prepareNavigationPolicy() {
+    const policy = this.runtimeEnvironment();
+    const context = this.context;
+    if (!context) return;
+    await this.prepareContext(context, { claimPages: false });
+    if (!policy.BROWSER_DOMAIN_ALLOWLIST && !policy.BROWSER_DOMAIN_DENYLIST) return;
+    const connection = this.browserCodeConnection;
+    if (!context || connection?.protocol !== 'cdp') throw new Error('Browser policy requires a CDP connection');
+    await Promise.all([...this.ownedPages].filter(page => !page.isClosed()).map(page => guardNavigationRedirects(context, page,
+      () => ({ ...(this.options.inheritEnvironment === false ? {} : process.env), ...contextAccessPolicyConfigurations.get(context) }), connection.endpoint)));
   }
 
   private async startNow() {
@@ -1858,7 +2012,7 @@ export class BrowserSession {
     const useElectronEmbeddedBrowser = this.browserSurface === 'electron-embedded';
     const forceBundledBrowser = isolated || (environment.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
     const channel = forceBundledBrowser ? undefined : environment.BROWSER_CHANNEL?.trim() || undefined;
-    const executablePath = environment.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || readManagedRuntime(environment)?.chromium || undefined;
+    const executablePath = managedChromiumOptions(environment).executablePath;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
     const sharedBrowserRuntimeKey = this.options.sharedBrowserRuntimeKey?.trim() || '';
     const rawCdpEndpoint = forceBundledBrowser
@@ -1970,8 +2124,10 @@ export class BrowserSession {
 
     if (transportAdapter.kind === 'electron-cdp' || transportAdapter.kind === 'cdp') {
       this.browserOwnership = 'connected';
-      this.browser = await chromium.connectOverCDP(cdpEndpoint);
-      this.browserCodeConnection = { protocol: 'cdp', endpoint: cdpEndpoint };
+      const protocol = environment.BROWSER_CONNECTION_PROTOCOL === 'playwright' ? 'playwright' : 'cdp';
+      this.browser = protocol === 'playwright' ? await chromium.connect(cdpEndpoint) : await chromium.connectOverCDP(cdpEndpoint);
+      this.browserCodeConnection = { protocol, endpoint: cdpEndpoint };
+      if (this.options.attachTargetId) { await this.selectAutomationTarget(this.options.attachTargetId); return; }
       if (transportAdapter.kind === 'electron-cdp') {
         // The renderer creates the exact session tab only after it receives the
         // backend browser:start event. Allow the realtime activation handshake
@@ -2235,6 +2391,51 @@ export class BrowserSession {
   }
 
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
+    contextAccessPolicyConfigurations.set(context, this.capabilityConfiguration);
+    const readContextPolicy: () => BrowserRuntimeEnvironment = () => ({
+      ...(this.options.inheritEnvironment === false ? {} : process.env),
+      ...contextAccessPolicyConfigurations.get(context),
+    });
+    const policyEndpoint = this.browserCodeConnection?.endpoint || '';
+    const hasRules = (policy: BrowserRuntimeEnvironment) => Boolean(policy.BROWSER_DOMAIN_ALLOWLIST?.trim() || policy.BROWSER_DOMAIN_DENYLIST?.trim());
+    const needsAccessPolicy = hasRules(readContextPolicy()) || context.pages().some(page => hasRules((pageAccessPolicyReaders.get(page) || readContextPolicy)()));
+    const previousPolicy = accessPolicyContexts.get(context);
+    // Playwright disables the HTTP cache whenever routing is enabled. Keep the
+    // interceptor absent when no page has site rules, and release it on clearing.
+    if (!needsAccessPolicy && previousPolicy) {
+      await context.unroute('**/*', previousPolicy);
+      accessPolicyContexts.delete(context);
+    }
+    if (needsAccessPolicy && !previousPolicy) {
+      // Context routing also covers the first request of popups and redirect hops.
+      // Read the policy for each navigation so already-open sessions see saved changes.
+      const routeHandler: Parameters<BrowserContext['route']>[1] = async route => {
+        const request = route.request();
+        if (request.isNavigationRequest()) {
+          // A popup's first request can precede its Frame/Page object.
+          let readPolicy = readContextPolicy;
+          let policyPage: Page | undefined;
+          try {
+            const page = request.frame().page();
+            policyPage = page;
+            const opener = pageAccessPolicyReaders.has(page) ? null : await page.opener();
+            readPolicy = pageAccessPolicyReaders.get(page) || (opener ? pageAccessPolicyReaders.get(opener) : undefined) || readPolicy;
+          } catch { /* Apply the context owner's policy until the popup is claimed. */ }
+          const policy = readPolicy();
+          if (!browserNavigationAllowed(request.url(), policy)) {
+            await route.abort('blockedbyclient');
+            return;
+          }
+          if (policyPage && (policy.BROWSER_DOMAIN_ALLOWLIST || policy.BROWSER_DOMAIN_DENYLIST)) {
+            try { await guardNavigationRedirects(context, policyPage, readPolicy, policyEndpoint); }
+            catch { await route.abort('blockedbyclient'); return; }
+          }
+        }
+        await route.fallback();
+      };
+      await context.route('**/*', routeHandler);
+      accessPolicyContexts.set(context, routeHandler);
+    }
     if (!preparedContextInitScripts.has(context)) {
       preparedContextInitScripts.add(context);
       await context.addInitScript(installAiBrowserPageRuntime, AI_DOM_RUNTIME_VERSION).catch((error) => {
@@ -2324,6 +2525,7 @@ export class BrowserSession {
     }
     const alreadyOwned = this.ownedPages.has(page);
     this.ownedPages.add(page);
+    pageAccessPolicyReaders.set(page, () => this.runtimeEnvironment());
     livePreviewVisibilityOwners.set(page, (visible) => this.handleLivePreviewVisibility(page, visible));
     if (!livePreviewVisibilityBindingPages.has(page)) {
       livePreviewVisibilityBindingPages.add(page);
@@ -2512,7 +2714,9 @@ export class BrowserSession {
 
   private async ensureBrowserPageRuntime(target: Page | Frame = this.activePage, signal?: AbortSignal) {
     signal?.throwIfAborted();
-    if ('mainFrame' in target) await this.applyConfiguredViewport(target, signal).catch(() => undefined);
+    if ('mainFrame' in target) {
+      await this.applyConfiguredViewport(target, signal).catch(() => undefined);
+    }
     signal?.throwIfAborted();
     const frame = 'mainFrame' in target ? target.mainFrame() : target;
     const navigationRevision = this.browserRuntimeRevisionByFrame.get(frame) || 0;
@@ -2818,6 +3022,7 @@ export class BrowserSession {
 
   private async activateSessionPage(page: Page) {
     this.ensureLivePreviewState();
+    if (this.livePreviewPointer && this.livePreviewPointer.page !== page) await this.releaseLivePreviewPointer();
     const sequence = ++this.livePreviewExplicitPageSelectionSequence;
     this.livePreviewExplicitPageSelectionAt = Date.now();
     this.page = page;
@@ -2928,7 +3133,9 @@ export class BrowserSession {
     let page: Page | undefined;
     let client: import('patchright').CDPSession | undefined;
     let fileChooserListener: ((chooser: FileChooser) => void) | undefined;
-    let pageBindingPromise: Promise<{ client: import('patchright').CDPSession; page: Page }> | undefined;
+    type CaptureBinding = { client: import('patchright').CDPSession; page: Page; generation: number };
+    let captureGeneration = 0;
+    let pageBindingPromise: Promise<CaptureBinding | undefined> | undefined;
     let captureTask: Promise<void> | undefined;
     let activeCaptures = 0;
     let captureDurationMs = 0;
@@ -2981,6 +3188,7 @@ export class BrowserSession {
     ) => {
       if (stopped || capturedPage.isClosed() || this.activePage !== capturedPage) return;
       framePump.push({
+        framesPerSecond: targetFps,
         capturedAt,
         contentType,
         data,
@@ -3004,10 +3212,11 @@ export class BrowserSession {
       // in claimPage(). Keep only a low-frequency reconciliation fallback for
       // browser/extension implementations that suppress visibility events.
       nextPageRefreshAt = currentTime + 2_000;
+      const refreshPage = this.page;
       pageRefreshPromise = this.refreshSessionGroupPages()
         .then(() => undefined)
         .catch((error) => {
-          if (!stopped) options.onError?.(error);
+          if (!stopped && this.page === refreshPage) options.onError?.(error);
         })
         .finally(() => {
           pageRefreshPromise = undefined;
@@ -3016,7 +3225,10 @@ export class BrowserSession {
     const detachCurrentPage = async () => {
       const currentClient = client;
       const currentPage = page;
+      // Invalidate pending work synchronously, before CDP rejects on detach.
+      captureGeneration += 1;
       client = undefined;
+      page = undefined;
       nativeCapture = false;
       latestNativeFrame = undefined;
       removeNativeFrameListener?.();
@@ -3026,84 +3238,102 @@ export class BrowserSession {
       if (!currentClient) return;
       await currentClient.detach().catch(() => undefined);
     };
-    const bindActivePage = async () => {
+    const bindActivePage = async (): Promise<CaptureBinding | undefined> => {
       refreshActivePageInBackground();
       const activePage = this.activePage;
-      if (page === activePage && client && !activePage.isClosed()) return { client, page: activePage };
+      if (page === activePage && client && !activePage.isClosed()) {
+        return { client, page: activePage, generation: captureGeneration };
+      }
       if (pageBindingPromise) return pageBindingPromise;
 
       pageBindingPromise = (async () => {
-        const nextActivePage = this.activePage;
-        if (page === nextActivePage && client && !nextActivePage.isClosed()) {
-          return { client, page: nextActivePage };
-        }
         await detachCurrentPage();
-        if (stopped) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Preview capture stopped');
-        const nextClient = await nextActivePage.context().newCDPSession(nextActivePage);
-        if (stopped) {
-          await nextClient.detach().catch(() => undefined);
-          throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'Preview capture stopped');
-        }
-        page = nextActivePage;
-        client = nextClient;
-        if (nativeListener) {
-          fileChooserListener = (chooser) => {
-            void this.liveFileControlForElement(nextActivePage, chooser.element() as ElementHandle<HTMLInputElement>)
-              .then((control) => {
-                if (!stopped && control) nativeListener({ control, kind: 'controlOpened' });
-              })
-              .catch((error) => {
-                if (!stopped) options.onError?.(error);
-              });
-          };
-          nextActivePage.on('filechooser', fileChooserListener);
-        }
-        const setupTimeout = setTimeout(() => {
-          if (client === nextClient) void detachCurrentPage();
-        }, 2_500);
+        if (stopped) return;
+        const nextActivePage = this.activePage;
+        const generation = captureGeneration;
+        const isCurrentAttempt = () => !stopped && generation === captureGeneration && this.page === nextActivePage;
+        let nextClient: import('patchright').CDPSession | undefined;
         try {
-          await Promise.all([
-            nextClient.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => undefined),
-            nextClient.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => undefined),
-          ]);
-        } finally { clearTimeout(setupTimeout); }
-        if (options.video && !stopped && client === nextClient) {
-          const onNativeFrame = (event: { sessionId: number; data: string; metadata: { deviceWidth: number; deviceHeight: number } }) => {
-            // Always acknowledge, including frames from a tab being detached.
-            void nextClient.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
-            if (stopped || client !== nextClient || this.activePage !== nextActivePage) return;
-            if (latestNativeFrame && latestNativeFrame.sequence !== deliveredNativeFrame) coalescedNativeFrames += 1;
-            sourceFrames += 1;
-            latestNativeFrame = {
-              data: Buffer.from(event.data, 'base64'),
-              width: event.metadata.deviceWidth,
-              height: event.metadata.deviceHeight,
-              capturedAt: new Date().toISOString(),
-              sequence: sourceFrames,
+          nextClient = await nextActivePage.context().newCDPSession(nextActivePage);
+          if (!isCurrentAttempt()) {
+            await nextClient.detach().catch(() => undefined);
+            return;
+          }
+          const boundClient = nextClient;
+          page = nextActivePage;
+          client = boundClient;
+          if (nativeListener) {
+            fileChooserListener = (chooser) => {
+              void this.liveFileControlForElement(nextActivePage, chooser.element() as ElementHandle<HTMLInputElement>)
+                .then((control) => {
+                  if (isCurrentAttempt() && control) nativeListener({ control, kind: 'controlOpened' });
+                })
+                .catch((error) => {
+                  if (isCurrentAttempt()) options.onError?.(error);
+                });
             };
-          };
-          nextClient.on('Page.screencastFrame', onNativeFrame);
-          removeNativeFrameListener = () => nextClient.off('Page.screencastFrame', onNativeFrame);
-          const startTimeout = setTimeout(() => {
-            if (client === nextClient) void detachCurrentPage();
+            nextActivePage.on('filechooser', fileChooserListener);
+          }
+          const setupTimeout = setTimeout(() => {
+            if (client === boundClient) void detachCurrentPage();
           }, 2_500);
           try {
-            await nextClient.send('Page.startScreencast', {
-              format,
-              ...(format === 'jpeg' ? { quality } : {}),
-              maxWidth: maximumDimensions.width,
-              maxHeight: maximumDimensions.height,
-              everyNthFrame: 1,
-            });
-            nativeCapture = client === nextClient && !stopped;
-            nativeStartedAt = Date.now();
-          } catch {
-            nextClient.off('Page.screencastFrame', onNativeFrame);
-            // Screenshot capture remains available when native streaming is unsupported.
-            nativeCapture = false;
-          } finally { clearTimeout(startTimeout); }
+            await Promise.all([
+              boundClient.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => undefined),
+              boundClient.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => undefined),
+            ]);
+          } finally { clearTimeout(setupTimeout); }
+          if (isCurrentAttempt()) {
+            const onNativeFrame = (event: { sessionId: number; data: string; metadata: { deviceWidth: number; deviceHeight: number } }) => {
+              // Always acknowledge, including frames from a detached target.
+              void boundClient.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+              if (!isCurrentAttempt()) return;
+              if (latestNativeFrame && latestNativeFrame.sequence !== deliveredNativeFrame) coalescedNativeFrames += 1;
+              sourceFrames += 1;
+              latestNativeFrame = {
+                data: Buffer.from(event.data, 'base64'),
+                width: event.metadata.deviceWidth,
+                height: event.metadata.deviceHeight,
+                capturedAt: new Date().toISOString(),
+                sequence: sourceFrames,
+              };
+            };
+            boundClient.on('Page.screencastFrame', onNativeFrame);
+            removeNativeFrameListener = () => boundClient.off('Page.screencastFrame', onNativeFrame);
+            const startTimeout = setTimeout(() => {
+              if (client === boundClient) void detachCurrentPage();
+            }, 2_500);
+            try {
+              await boundClient.send('Page.startScreencast', {
+                format,
+                ...(format === 'jpeg' ? { quality } : {}),
+                maxWidth: maximumDimensions.width,
+                maxHeight: maximumDimensions.height,
+                everyNthFrame: 1,
+              });
+              if (isCurrentAttempt()) {
+                nativeCapture = true;
+                nativeStartedAt = Date.now();
+              }
+            } catch {
+              boundClient.off('Page.screencastFrame', onNativeFrame);
+              // Only the current target can select screenshot fallback.
+              if (isCurrentAttempt()) nativeCapture = false;
+            } finally { clearTimeout(startTimeout); }
+          }
+          if (!isCurrentAttempt()) {
+            if (client === boundClient) await detachCurrentPage();
+            else await boundClient.detach().catch(() => undefined);
+            return;
+          }
+          return { client: boundClient, page: nextActivePage, generation };
+        } catch (error) {
+          if (!isCurrentAttempt()) {
+            await nextClient?.detach().catch(() => undefined);
+            return;
+          }
+          throw error;
         }
-        return { client: nextClient, page: nextActivePage };
       })();
       try {
         return await pageBindingPromise;
@@ -3114,12 +3344,17 @@ export class BrowserSession {
     const captureFrame = async () => {
       if (stopped) return;
       const binding = await bindActivePage();
-      const isCurrentPage = () => !stopped && client === binding.client
-        && this.activePage === binding.page && !binding.page.isClosed();
+      if (!binding) return;
+      const isCurrentBinding = () => !stopped && binding.generation === captureGeneration
+        && client === binding.client && this.page === binding.page;
+      const isCurrentPage = () => isCurrentBinding() && !binding.page.isClosed();
       if (!isCurrentPage()) return;
       if (nativeCapture) {
         const latest = latestNativeFrame;
         if (latest) {
+          // Independent images need only changed pixels. Video still receives
+          // repeats to keep its fixed-rate presentation clock advancing.
+          if (!options.video && deliveredNativeFrame === latest.sequence) return;
           const scale = Math.min(1, maximumDimensions.width / latest.width, maximumDimensions.height / latest.height);
           const outputViewport = { width: Math.max(1, Math.round(latest.width * scale)), height: Math.max(1, Math.round(latest.height * scale)) };
           if (deliveredNativeFrame === latest.sequence) duplicateFrames += 1;
@@ -3136,6 +3371,7 @@ export class BrowserSession {
         removeNativeFrameListener = undefined;
         await binding.client.send('Page.stopScreencast').catch(() => undefined);
       }
+      if (!isCurrentPage()) return;
       const startedAt = performance.now();
       activeCaptures = 1;
       const captureTimeout = setTimeout(() => {
@@ -3191,6 +3427,10 @@ export class BrowserSession {
           deviceHeight: outputViewport.height,
           deviceWidth: outputViewport.width,
         });
+      } catch (error) {
+        // Cancellation belongs to the retired binding; genuine current-target
+        // errors must still reach the consumer, regardless of their message.
+        if (isCurrentBinding()) throw error;
       } finally {
         clearTimeout(captureTimeout);
         activeCaptures = 0;
@@ -3603,9 +3843,32 @@ export class BrowserSession {
     }
   }
 
+  private async releaseLivePreviewPointer(gestureId?: string) {
+    const pointer = this.livePreviewPointer;
+    if (!pointer || (gestureId !== undefined && pointer.gestureId !== gestureId)) return;
+    this.livePreviewPointer = undefined;
+    if (pointer.pressed && !pointer.page.isClosed()) {
+      await pointer.page.mouse.up({ button: pointer.button, clickCount: pointer.clickCount });
+    }
+  }
+
   async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
     return this.withSessionOperation(async () => {
-
+    try {
+    if (input.kind === 'pointer' && input.phase === 'cancel') {
+      await this.releaseLivePreviewPointer(input.gestureId);
+      return { ok: true, actual: 'Live browser pointer released.' };
+    }
+    if (input.kind === 'tab' || input.kind === 'browserControl' || input.kind === 'click' || input.kind === 'drag'
+      || (input.kind === 'pointer' && input.phase === 'down')) {
+      await this.releaseLivePreviewPointer();
+    }
+    if (input.kind === 'pointer' && input.phase === 'up' && this.livePreviewPointer?.gestureId !== input.gestureId) {
+      return { ok: true, actual: 'Live browser pointer gesture already ended.' };
+    }
+    if (input.kind === 'move' && input.gestureId !== this.livePreviewPointer?.gestureId) {
+      return { ok: true, actual: 'Ignored a move outside the current pointer gesture.' };
+    }
     if (input.kind === 'tab') return this.switchLivePreviewTab(input.tabId);
     if (input.kind === 'browserControl') {
       if (input.action === 'navigate') return this.executeBrowserControl({ action: 'navigate', url: input.url });
@@ -3624,7 +3887,7 @@ export class BrowserSession {
     }
     if (input.kind === 'files') return this.applyLiveFiles(input);
     if (input.kind === 'dialog') return this.resolveLiveDialog(input);
-    const page = this.activePage;
+    const page = this.livePreviewPointer?.page || this.activePage;
     await this.ensureBrowserPageRuntime(page);
     const clampRatio = (value: number) => Math.min(1, Math.max(0, Number(value)));
     const invalidateObservation = () => {
@@ -3640,22 +3903,45 @@ export class BrowserSession {
       this.lastInteractiveCandidates = [];
     };
 
-    if (input.kind === 'move' || input.kind === 'click' || input.kind === 'drag' || input.kind === 'scroll') {
+    if (input.kind === 'move' || input.kind === 'pointer' || input.kind === 'click' || input.kind === 'drag' || input.kind === 'scroll') {
       if (!Number.isFinite(input.xRatio) || !Number.isFinite(input.yRatio)) {
+        if (input.kind === 'pointer') await this.releaseLivePreviewPointer(input.gestureId);
         return { ok: false, actual: 'Live browser input requires finite relative coordinates.' };
       }
-      const viewport = await this.getViewportMetrics();
+      const viewport = await this.getViewportMetrics(page);
       const x = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.xRatio) * viewport.width)));
       const y = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.yRatio) * viewport.height)));
       if (input.kind === 'move') {
+        const pointer = this.livePreviewPointer;
+        if (pointer && Math.hypot(x - pointer.startX, y - pointer.startY) >= 4) pointer.moved = true;
+        if (this.livePreviewPointer && !this.livePreviewPointer.pressed) {
+          return { ok: true, actual: 'Live browser pointer is handled by a native control.' };
+        }
         await page.mouse.move(x, y);
+        if (this.livePreviewPointer) invalidateObservation();
         return { ok: true, actual: `Live browser pointer moved to (${x}, ${y}).` };
       }
 
-      if (input.kind === 'click') {
+      if (input.kind === 'click' || input.kind === 'pointer') {
         const button = input.button === 'right' || input.button === 'middle' ? input.button : 'left';
         const clickCount = Math.min(2, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
-        const liveControl = button === 'left' && clickCount === 1
+        const releasing = input.kind === 'pointer' && input.phase === 'up';
+        const pointer = input.kind === 'pointer'
+          ? releasing ? this.livePreviewPointer! : (this.livePreviewPointer = {
+              button, clickCount, gestureId: input.gestureId, page, pressed: false, startX: x, startY: y, moved: false,
+            })
+          : undefined;
+        if (releasing) {
+          this.livePreviewPointer = undefined;
+          if (!pointer!.pressed) {
+            if (pointer!.download && !pointer!.moved && Math.hypot(x - pointer!.startX, y - pointer!.startY) < 4) {
+              this.relayLivePreviewDownload(pointer!.download);
+            }
+            invalidateObservation();
+            return { ok: true, actual: 'Live browser pointer gesture completed.' };
+          }
+        }
+        const liveControl = !releasing && button === 'left' && clickCount === 1
           ? await this.liveNativeControlAt(page, x, y)
           : undefined;
         if (liveControl) {
@@ -3667,10 +3953,14 @@ export class BrowserSession {
             ...(liveControl.kind === 'select' ? { liveSelect: liveControl } : {}),
           };
         }
-        const downloadLink = button === 'left' && clickCount === 1
+        const downloadLink = !releasing && button === 'left' && clickCount === 1
           ? await this.liveDownloadLinkAt(page, x, y)
           : undefined;
         if (downloadLink) {
+          if (pointer) {
+            pointer.download = downloadLink;
+            return { ok: true, actual: 'Live browser download link pressed.' };
+          }
           this.relayLivePreviewDownload(downloadLink);
           invalidateObservation();
           return { ok: true, actual: `Relayed download link to the user browser: ${downloadLink.url}` };
@@ -3679,7 +3969,11 @@ export class BrowserSession {
         const popupPromise = button === 'left'
           ? page.waitForEvent('popup', { timeout: 1500 }).catch(() => undefined)
           : Promise.resolve(undefined);
-        if (button === 'left') this.livePreviewBackgroundPopupOpeners.add(page);
+        if (button === 'left') {
+          this.livePreviewPopupWatchCounts ||= new WeakMap<Page, number>();
+          this.livePreviewPopupWatchCounts.set(page, (this.livePreviewPopupWatchCounts.get(page) || 0) + 1);
+          this.livePreviewBackgroundPopupOpeners.add(page);
+        }
         const popupSelectionSequence = this.livePreviewExplicitPageSelectionSequence;
         let resolveDialogOpened: (() => void) | undefined;
         const dialogOpened = new Promise<void>((resolve) => { resolveDialogOpened = resolve; });
@@ -3687,18 +3981,6 @@ export class BrowserSession {
           if (dialogPage === page) resolveDialogOpened?.();
         };
         if (button === 'left') this.liveDialogOpenedWaiters.add(dialogWaiter);
-        const clickPromise = page.mouse.click(x, y, { button, clickCount });
-        try {
-          const outcome = button === 'left'
-            ? await Promise.race([
-                clickPromise.then(() => 'clicked' as const),
-                dialogOpened.then(() => 'dialog' as const),
-              ])
-            : await clickPromise.then(() => 'clicked' as const);
-          if (outcome === 'dialog') void clickPromise.catch(() => undefined);
-        } finally {
-          this.liveDialogOpenedWaiters.delete(dialogWaiter);
-        }
         void popupPromise.then(async (popup) => {
           if (!popup) return;
           this.livePreviewBackgroundPageUntil.set(popup, Date.now() + 2_000);
@@ -3720,10 +4002,43 @@ export class BrowserSession {
           }
           await this.refreshSessionGroupPages({ forceNativeRefresh: true });
         }).catch(() => undefined).finally(() => {
-          this.livePreviewBackgroundPopupOpeners.delete(page);
+          if (button === 'left') {
+            const remaining = Math.max(0, (this.livePreviewPopupWatchCounts.get(page) || 1) - 1);
+            this.livePreviewPopupWatchCounts.set(page, remaining);
+            if (!remaining) this.livePreviewBackgroundPopupOpeners.delete(page);
+          }
         });
+        const clickPromise = input.kind === 'click'
+          ? page.mouse.click(x, y, { button, clickCount })
+          : (async () => {
+              await page.mouse.move(x, y);
+              if (releasing) await page.mouse.up({ button: pointer!.button, clickCount: pointer!.clickCount });
+              else {
+                pointer!.pressed = true;
+                await page.mouse.down({ button, clickCount });
+              }
+            })();
+        try {
+          const outcome = button === 'left'
+            ? await Promise.race([
+                clickPromise.then(() => 'clicked' as const),
+                dialogOpened.then(() => 'dialog' as const),
+              ])
+            : await clickPromise.then(() => 'clicked' as const);
+          if (outcome === 'dialog') void clickPromise.catch(() => undefined);
+        } catch (error) {
+          if (pointer?.pressed) {
+            if (this.livePreviewPointer === pointer) this.livePreviewPointer = undefined;
+            await page.mouse.up({ button: pointer.button, clickCount: pointer.clickCount }).catch(() => undefined);
+          }
+          throw error;
+        } finally {
+          this.liveDialogOpenedWaiters.delete(dialogWaiter);
+        }
         invalidateObservation();
-        return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
+        return { ok: true, actual: input.kind === 'click'
+          ? `Live browser clicked (${x}, ${y}).`
+          : `Live browser pointer ${input.phase} at (${x}, ${y}).` };
       }
 
       if (input.kind === 'drag') {
@@ -3824,7 +4139,12 @@ export class BrowserSession {
     }
 
     return { ok: false, actual: 'Live browser input kind is unsupported.' };
-
+    } catch (error) {
+      if (input.kind === 'pointer' || (input.kind === 'move' && input.gestureId)) {
+        await this.releaseLivePreviewPointer(input.gestureId).catch(() => undefined);
+      }
+      throw error;
+    }
     });
   }
 
@@ -3984,6 +4304,9 @@ export class BrowserSession {
   }
 
   private detachPageListeners(page: Page) {
+    pageAccessPolicyReaders.delete(page);
+    const pendingGuard = navigationResponseGuards.get(page);
+    if (pendingGuard) void pendingGuard.then(() => navigationResponseGuardDisposers.get(page)?.()).catch(() => undefined);
     this.networkDiagnostics.detach(page);
     this.pageListenerDisposers ||= new Map<Page, () => void>();
     this.livePreviewDownloadListeners ||= new Map<Page, (download: PlaywrightDownload) => void>();
@@ -4152,56 +4475,183 @@ export class BrowserSession {
     return this.withSessionOperation(async (signal) => {
       const before = await this.readPageObservation().catch(() => undefined);
       const page = this.activePage;
-      const surfaceId = before?.activeSurface?.id;
-      const point = { x: 0, y: 0 };
+      const observedOverlays = before?.surfaces.filter((surface) => surface.likelyOverlay) || [];
+      const observedSurface = before?.activeSurface
+        || (observedOverlays.length === 1 ? observedOverlays[0] : undefined);
+      if (!before || !observedSurface) {
+        const ambiguous = observedOverlays.length > 1;
+        return {
+          ok: Boolean(before) && !ambiguous,
+          ...(!before || ambiguous ? { failureCategory: ERROR_CODES.SURFACE_DISMISSAL_UNCONFIRMED } : {}),
+          summary: !before ? 'Surface state is unavailable; no dismissal input was sent.'
+            : ambiguous ? 'Visible overlays are ambiguous; no dismissal input was sent.'
+              : 'No active surface was observed; no dismissal input was sent.',
+          data: { method: 'none', before, after: before, closureConfirmed: false,
+            actionOutcome: 'skipped', outcome: !before ? 'observation-unavailable'
+              : ambiguous ? 'ambiguous-surface' : 'no-active-surface' },
+        };
+      }
+      const surfaceId = observedSurface.id;
+      let method: 'close-control-click' | 'corner-click' = 'corner-click';
+      let point = { x: 0, y: 0 };
+      let inputAttempted = false;
       this.stateReader?.clear();
       this.browserViewportEvidence = undefined;
-      this.latestBrowserObservation = { status: 'unavailable', error: 'A surface dismissal was attempted; earlier screenshots are stale.' };
+      this.latestBrowserObservation = { status: 'unavailable', error: 'A surface dismissal was requested; read fresh state.' };
       try {
-        await raceWithAbort(page.mouse.click(point.x, point.y), signal);
+        const frame = observedSurface.framePath ? this.frameFromPath(observedSurface.framePath) : page.mainFrame();
+        if (!frame) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The observed surface frame is unavailable.');
+        await this.ensureBrowserPageRuntime(frame);
+        for (let ownerFrame = frame; ownerFrame.parentFrame();) {
+          const parentFrame = ownerFrame.parentFrame()!;
+          await this.ensureBrowserPageRuntime(parentFrame);
+          const owner = await ownerFrame.frameElement();
+          try {
+            const disabled = await owner.evaluate((element) => !(element instanceof Element)
+              || (window as WindowWithAiDomRuntime).__aiDomRuntime!.isDisabledElement(element));
+            if (disabled) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The observed surface belongs to a disabled frame.');
+          } finally { await owner.dispose(); }
+          ownerFrame = parentFrame;
+        }
+        if (!observedSurface.selector) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The observed surface has no live selector.');
+        const scope = frame.locator(observedSurface.selector);
+        if (await scope.count() !== 1) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The observed surface selector is no longer unique.');
+        const scopeBox = await scope.evaluate((element) => {
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, width: rect.width, height: rect.height };
+        });
+        const handles = await scope.locator(
+          'button, [role="button"], input[type="button"], input[type="submit"], [aria-label*="close" i], [title*="close" i], '
+          + '[aria-label*="关闭"], [title*="关闭"], [class*="close" i], [class*="dismiss" i]',
+        ).filter({ visible: true }).elementHandles();
+        try {
+          const candidates: Array<{ handle: typeof handles[number]; score: number }> = [];
+          for (const handle of handles.slice(0, 128)) {
+            const score = await handle.evaluate((element, box) => {
+              if (!(element instanceof Element) || ['svg', 'use'].includes(element.localName)) return 0;
+              const names = [
+                element.getAttribute('aria-label'), element.getAttribute('title'),
+                element instanceof HTMLInputElement ? element.value : undefined, element.textContent,
+              ].map((value) => String(value || '').replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+              const closeName = /^(?:关闭(?:(?:当前|此|该)?(?:对话框|弹窗|窗口|面板|菜单|提示框))?|(?:close|dismiss)(?: (?:this )?(?:dialog|modal|window|popup|popover|panel|menu|tooltip))?)$/i;
+              const cancelName = /^(?:取消|cancel)$/i;
+              const glyphName = /^[×✕✖x]$/i;
+              const close = names.some(name => closeName.test(name));
+              const cancel = names.some(name => cancelName.test(name));
+              // Conflicting visible/accessibility names are not a clear dismiss control.
+              if (names.some(name => !closeName.test(name) && !cancelName.test(name) && !glyphName.test(name))) return 0;
+              const rect = element.getBoundingClientRect();
+              const small = rect.width <= Math.min(200, box.width / 2) && rect.height <= 64;
+              const topBand = Math.min(96, box.height / 2, Math.max(64, box.height / 4));
+              const atTop = small && rect.top >= box.top - 2 && rect.top + rect.height / 2 <= box.top + topBand;
+              const atCorner = atTop && (rect.left + rect.width / 2 <= box.left + Math.min(96, box.width / 4)
+                || rect.left + rect.width / 2 >= box.right - Math.min(96, box.width / 4));
+              const closeClass = /(?:^|[-_\s])(?:close|dismiss)(?:[-_\s]|(?:icon|button|btn)$)/i.test(element.getAttribute('class') || '');
+              const closeIcon = atTop && closeClass
+                && (names.length === 0 || names.every(name => closeName.test(name) || glyphName.test(name)));
+              const explicitUiClose = names.some(name => closeName.test(name)
+                && !/^(?:关闭|close|dismiss)$/i.test(name));
+              const dialogSubmit = element instanceof HTMLButtonElement && element.type === 'submit'
+                && (element.formMethod === 'dialog' || !element.hasAttribute('formmethod') && element.form?.method === 'dialog');
+              // A footer's bare "Close" can confirm a business operation.
+              // Prefer structural close controls and do not infer that action's meaning.
+              const score = closeIcon ? 6 : close && atCorner ? 5 : cancel ? 4
+                : explicitUiClose || close && dialogSubmit ? 3 : 0;
+              const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime;
+              return score && runtime?.actionability(element, { action: 'click' }).ok ? score : 0;
+            }, scopeBox).catch(() => 0);
+            if (score) candidates.push({ handle, score });
+          }
+          candidates.sort((left, right) => right.score - left.score);
+          const selected = candidates[0] && (candidates.length === 1 || candidates[0].score > candidates[1].score)
+            ? candidates[0].handle : undefined;
+          if (selected) {
+            const actionable = await selected.evaluate((element) => {
+              if (!(element instanceof Element)) return { ok: false, reason: 'The observed close control is not a live element.' };
+              return (window as WindowWithAiDomRuntime).__aiDomRuntime!.actionability(element, { action: 'click' });
+            });
+            if (!actionable.ok) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, actionable.reason);
+            const rect = await selected.boundingBox();
+            if (!rect) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'The observed close control has no current bounding box.');
+            point = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            method = 'close-control-click';
+            inputAttempted = true;
+            await raceWithAbort(selected.click({ timeout: 5_000 }), signal);
+          } else {
+            if (frame !== page.mainFrame()) {
+              throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, 'No clear frame-local close control was observed; a main-page corner cannot dismiss this frame safely.');
+            }
+            const background = await page.evaluate(({ x, y }) => {
+              let hit = document.elementFromPoint(x, y);
+              for (let depth = 0; hit?.shadowRoot && depth < 32; depth += 1) {
+                const inner = hit.shadowRoot.elementFromPoint(x, y);
+                if (!inner || inner === hit) break;
+                hit = inner;
+              }
+              if (!hit) return { safe: false, reason: 'The background dismissal point is not readable.' };
+              let current: Element | null = hit;
+              for (let depth = 0; current && depth < 64; depth += 1) {
+                const role = (current.getAttribute('role') || '').toLowerCase();
+                const interactive = current.matches('button,input,select,textarea,a[href],summary,iframe,object,embed,canvas,video[controls],audio[controls]')
+                  || ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'tab',
+                    'checkbox', 'radio', 'switch', 'textbox', 'combobox', 'slider', 'spinbutton', 'treeitem'].includes(role)
+                  || current instanceof HTMLElement && (current.tabIndex >= 0 || current.isContentEditable)
+                  || window.getComputedStyle(current).cursor === 'pointer';
+                if (interactive) return { safe: false, reason: 'The background dismissal point overlaps an interactive control.' };
+                const root = current.getRootNode();
+                current = current.parentElement || (root instanceof ShadowRoot ? root.host : null);
+              }
+              return { safe: true, reason: '' };
+            }, point);
+            if (!background.safe) throw new CodedError(ERROR_CODES.BROWSER_OPERATION_FAILED, background.reason);
+            inputAttempted = true;
+            await raceWithAbort(page.mouse.click(point.x, point.y), signal);
+          }
+        } finally {
+          await Promise.allSettled(handles.map((handle) => handle.dispose()));
+        }
       } catch (error) {
         const after = await this.readPageObservation().catch(() => undefined);
         return { ok: false, failureCategory: ERROR_CODES.SURFACE_DISMISSAL_UNCERTAIN,
-          summary: 'The dismissal input failed or timed out; inspect current state before another action.',
-          data: { error: unknownErrorMessage(error), method: 'corner-click', before, after, point, outcome: 'unknown' } };
+          summary: 'The dismissal could not be completed; inspect current state before another action.',
+          data: { error: unknownErrorMessage(error), method, before, after, point, inputAttempted,
+            closureConfirmed: false, outcome: inputAttempted ? 'unknown' : 'not-started' } };
       }
       let after = await this.readPageObservation().catch(() => undefined);
-      if (!after) return { ok: true,
-        summary: 'The corner click was sent, but the resulting surface state could not be read.',
-        data: { method: 'corner-click', before, point, outcome: ERROR_CODES.OBSERVATION_UNAVAILABLE } };
+      if (!after) return { ok: false, failureCategory: ERROR_CODES.SURFACE_DISMISSAL_UNCONFIRMED,
+        summary: 'Dismissal input was sent, but the resulting surface state could not be read.',
+        data: { method, before, point, inputAttempted, closureConfirmed: false, outcome: 'observation-unavailable' } };
       const deadline = Date.now() + 900;
-      while (surfaceId && Date.now() < deadline && after.surfaces.some((candidate) => candidate.id === surfaceId)) {
+      while (Date.now() < deadline && after.surfaces.some((candidate) => candidate.id === surfaceId)) {
         await raceWithAbort(new Promise<void>((resolve) => setTimeout(resolve, 60)), signal);
         const refreshed = await this.readPageObservation().catch(() => undefined);
         if (!refreshed) break;
         after = refreshed;
       }
-      const closed = Boolean(surfaceId) && !after.surfaces.some((candidate) => candidate.id === surfaceId);
-      const replacementPopup = Boolean(before && after.activeSurface?.likelyOverlay
-        && !after.activeSurface.modal && after.activeSurface.id !== surfaceId
-        && !before.surfaceStack.some((candidate) => candidate.id === after.activeSurface?.id));
-      const navigated = Boolean(before && after.url !== before.url);
-      const lostParentSurfaceIds = (before?.surfaceStack || [])
+      const closed = !after.surfaces.some((candidate) => candidate.id === surfaceId);
+      const replacementPopup = Boolean(after.activeSurface?.likelyOverlay
+        && after.activeSurface.id !== surfaceId
+        && !before.surfaces.some((candidate) => candidate.id === after.activeSurface?.id));
+      const navigated = after.url !== before.url;
+      const lostParentSurfaceIds = before.surfaceStack
         .filter((candidate) => candidate.id !== surfaceId && !after.surfaces.some((next) => next.id === candidate.id))
         .map((candidate) => candidate.id);
       const verified = closed && !replacementPopup && !navigated && lostParentSurfaceIds.length === 0;
-      const unconfirmed = !surfaceId && !replacementPopup && !navigated;
       return {
-        ok: true,
+        ok: verified,
+        ...(!verified ? { failureCategory: ERROR_CODES.SURFACE_DISMISSAL_UNCONFIRMED } : {}),
         summary: verified ? 'The observed surface closed and its parent surfaces remain open.'
-          : navigated ? 'The corner click changed the page URL; inspect before continuing.'
-            : replacementPopup ? 'Another popup is active after the corner click; inspect before continuing.'
+          : navigated ? 'Dismissal changed the page URL; inspect before continuing.'
+            : replacementPopup ? 'Another popup is active after dismissal; inspect before continuing.'
               : closed ? 'The surface closed, but a parent surface also disappeared; inspect before continuing.'
-                : unconfirmed ? `The corner click was sent. ${before ? 'No active surface was detected' : 'The initial surface state was unavailable'}, so closure is unconfirmed.`
-                  : 'The corner click completed, but the observed surface remains open.',
-        data: { method: 'corner-click', before, after, lostParentSurfaceIds, point,
+                : 'Dismissal input completed, but the observed surface remains open.',
+        data: { method, before, after, lostParentSurfaceIds, point, inputAttempted,
           closureConfirmed: verified, observedSurfaceId: surfaceId, urlChanged: navigated,
           outcome: verified ? 'verified-closed' : navigated ? 'navigation-side-effect' : replacementPopup ? 'popup-replaced'
-            : closed ? 'side-effect' : unconfirmed ? 'unconfirmed' : 'verified-open' },
+            : closed ? 'side-effect' : 'verified-open' },
       };
     }, input.abortSignal);
   }
-
 
   async readStructuredPageText() {
     return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
@@ -4911,6 +5361,37 @@ export class BrowserSession {
   async executeBrowserCode(input: Parameters<BrowserSession['executeBrowserCodeCell']>[0]): Promise<BrowserActionResult> {
     return this.withSessionOperation(async (signal) => {
       this.latestBrowserObservation = { status: 'unavailable', error: 'Browser code is running; previous screenshot is no longer current.' };
+      const networkResponseStart = this.networkDiagnostics.responseSequence;
+      const networkPages = new Set<Page>();
+      if (this.page) networkPages.add(this.page);
+      const withNetworkErrors = (output: BrowserActionResult): BrowserActionResult => {
+        if (this.page) networkPages.add(this.page);
+        const failed = [...networkPages].flatMap(page => this.networkDiagnostics.records(page))
+          .filter(record => (record.responseSequence || 0) > networkResponseStart
+            && record.status !== undefined && record.status >= 500 && record.status < 600)
+          .sort((left, right) => (left.responseSequence || 0) - (right.responseSequence || 0));
+        if (!failed.length) return output;
+        const endpoint = (value: string) => {
+          try {
+            const url = new URL(value);
+            return /^https?:$/.test(url.protocol)
+              ? `${url.origin}${url.pathname}`.slice(0, 600) : url.protocol;
+          } catch { return '[unparseable URL]'; }
+        };
+        const indicators = new Map<string, { kind: string; requestId: string; method: string; url: string; status: number; resourceType: string }>();
+        for (const record of failed) {
+          const url = endpoint(record.url);
+          indicators.set(`${record.method} ${record.status} ${url}`, {
+            kind: 'http-server-error', requestId: record.id, method: record.method,
+            url, status: record.status!, resourceType: record.resourceType,
+          });
+        }
+        const data = output.data && typeof output.data === 'object' ? output.data as Record<string, unknown> : {};
+        return { ...output,
+          data: { ...data, networkErrorIndicators: [...indicators.values()].slice(-5), networkErrorCount: failed.length },
+          summary: `${output.summary || 'Browser script returned.'} Observed ${failed.length} HTTP 5xx response(s) during this call; inspect networkErrorIndicators before interpreting the page result.`,
+        };
+      };
       let result: BrowserActionResult;
       try {
         result = await this.executeBrowserCodeCell({ ...input, abortSignal: signal });
@@ -4929,7 +5410,7 @@ export class BrowserSession {
         const observation = { status: 'disabled' as const,
           disabledReason: input.imageInputAvailable === false ? ERROR_CODES.MODEL_IMAGE_INPUT_UNAVAILABLE : ERROR_CODES.AUTOMATIC_SCREENSHOT_DISABLED };
         this.latestBrowserObservation = observation;
-        return { ...withoutSingularImagePath, browserObservation: observation };
+        return withNetworkErrors({ ...withoutSingularImagePath, browserObservation: observation });
       }
       let observation: NonNullable<BrowserActionResult['browserObservation']>;
       const capture = new BrowserOperationDeadline(boundedPositiveIntegerEnv(
@@ -4946,6 +5427,47 @@ export class BrowserSession {
           return { documentId: win.__aiCoordinateEvidenceDocumentId, url: location.href, domEpoch: Number(win.__aiDomMutationState?.epoch || 0),
             width: innerWidth, height: innerHeight, devicePixelRatio, scrollX, scrollY };
         });
+        const renderingSettled = await capture.step('viewport-render-settle', async () => {
+          const frames = page.frames().slice(0, 25).filter(frame => !frame.isDetached());
+          const settled = await Promise.all(frames.map(frame => frame.evaluate(async () => {
+            const finiteAnimations = () => document.getAnimations().filter(animation => {
+              const effect = animation.effect;
+              const target = effect instanceof KeyframeEffect ? effect.target : undefined;
+              return animation.playState === 'running'
+                && Number.isFinite(effect?.getComputedTiming().endTime)
+                && !(target instanceof Element && target.closest(
+                  '#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__',
+                ));
+            });
+            const deadline = performance.now() + 1500;
+            let animations = finiteAnimations();
+            while (animations.length && performance.now() < deadline) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              await Promise.race([
+                Promise.all(animations.map(animation => animation.finished.catch(() => undefined))),
+                new Promise<void>(resolve => {
+                  timer = setTimeout(resolve, Math.max(1, deadline - performance.now()));
+                }),
+              ]);
+              if (timer !== undefined) clearTimeout(timer);
+              animations = finiteAnimations();
+            }
+            if (animations.length) return false;
+            // Layout completion precedes paint. Do not rewrite styles or cancel
+            // application animations to manufacture a finished screenshot.
+            let painted = false;
+            await new Promise<void>(resolve => {
+              const timer = setTimeout(resolve, 250);
+              requestAnimationFrame(() => requestAnimationFrame(() => {
+                painted = true;
+                clearTimeout(timer);
+                resolve();
+              }));
+            });
+            return painted && finiteAnimations().length === 0;
+          }).catch(() => frame.isDetached())));
+          return settled.every(Boolean);
+        });
         const before = await capture.step('viewport-before', readGeometry);
         const dir = this.artifactDirectory(input.runId || 'browser-code');
         await capture.step('screenshot-directory', () => mkdir(dir, { recursive: true }));
@@ -4954,9 +5476,10 @@ export class BrowserSession {
           capture: 'viewport', filePath: imagePath, outputPixelRatio: 1, timeoutMs: capture.timeoutMs,
         }));
         const after = await capture.step('viewport-after', readGeometry);
-        if (JSON.stringify(before) === JSON.stringify(after)) this.browserViewportEvidence = { ...after, capturedAt: Date.now() };
+        if (renderingSettled && JSON.stringify(before) === JSON.stringify(after)) this.browserViewportEvidence = { ...after, capturedAt: Date.now() };
         observation = { status: 'available', id: randomUUID(), path: imagePath, url: page.url(), capturedAt: new Date().toISOString(),
-          actionable: Boolean(this.browserViewportEvidence), domEpoch: after.domEpoch, retention: input.observationMode || 'replace' };
+          actionable: Boolean(this.browserViewportEvidence), domEpoch: after.domEpoch, retention: input.observationMode || 'replace',
+          ...(!renderingSettled ? { error: 'Final page rendering has not settled. Observe again before coordinate input.' } : {}) };
       } catch (error) {
         if (signal.aborted) throw error;
         observation = { status: 'unavailable', error: error instanceof Error ? error.message : String(error) };
@@ -4964,7 +5487,7 @@ export class BrowserSession {
         capture.dispose();
       }
       this.latestBrowserObservation = observation;
-      return { ...withoutSingularImagePath, browserObservation: observation };
+      return withNetworkErrors({ ...withoutSingularImagePath, browserObservation: observation });
     }, input.abortSignal);
   }
 
@@ -5142,6 +5665,7 @@ export class BrowserSession {
       ? execution.value as Record<string, unknown> : undefined;
     const payload = {
       result: execution.value ?? null,
+      ...(execution.partialResults !== undefined ? { partialResults: execution.partialResults } : {}),
       ...(noDeclaredActionExecuted ? {
         actionOutcome: 'skipped',
         actionNote: 'The code declared a browser action, but no browser action was attempted. A conditional target guard may have skipped it. The returned page data is still valid; inspect the current target before choosing a changed action.',
@@ -5177,6 +5701,9 @@ export class BrowserSession {
         : `Browser script ${reportedFailure ? 'returned a failure' : execution.executionState?.status || 'failed'}; ${execution.executionState?.completedActions.length || 0} action(s) completed. Review data.error, data.diagnostics when available, and the current observation before choosing a changed recovery action.`,
       ...(emittedImagePaths.length ? { referenceImagePath: emittedImagePaths[0], referenceImagePaths: emittedImagePaths } : {}),
     };
+    if (execution.kernelReset) {
+      result.summary += ` The browserCode kernel was recycled (${execution.kernelReset.reason}); reinitialize top-level bindings and response listeners before the next code call.`;
+    }
     signal.throwIfAborted();
     return result;
 
@@ -5275,6 +5802,7 @@ export class BrowserSession {
     this.activeScreencasts.clear();
     await Promise.all(activeScreencasts.map((handle) => handle.stop().catch(() => undefined)));
     await Promise.all([this.dismissPendingLiveDialogs(), this.clearPendingLiveFileInputs()]);
+    await this.releaseLivePreviewPointer().catch(() => undefined);
     await this.downloadManager?.dispose();
     this.downloadManager = undefined;
     this.stateReader?.clear();
@@ -5315,7 +5843,7 @@ export class BrowserSession {
           return;
         }
         if (options.closePages) await this.closeOwnedPages();
-        const managedProfileBrowserClosed = options.force
+        const managedProfileBrowserClosed = options.force && !this.options.attachTargetId
           ? await closeConnectedBrowserProcess(this.browser)
           : false;
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
@@ -5333,6 +5861,8 @@ export class BrowserSession {
       this.parentBrowserSession?.childBrowserSessions.delete(this);
       this.parentBrowserSession = undefined;
       if (!shouldKeepOpen || disposeLocalState) {
+        await this.automationObserver?.close().catch(() => undefined);
+        this.automationObserver = undefined;
         unregisterBrowserSession(this);
         this.page = undefined;
         this.context = undefined;
@@ -5430,7 +5960,8 @@ export class BrowserSession {
         text,
         valueLength: 'value' in field ? value?.length || 0 : undefined,
         contentEditable: element.isContentEditable,
-        disabled: Boolean((field as HTMLInputElement).disabled),
+        disabled: (window as WindowWithAiDomRuntime).__aiDomRuntime?.isDisabledElement(element)
+          ?? Boolean((field as HTMLInputElement).disabled),
         readOnly: Boolean((field as HTMLInputElement).readOnly),
         selectionStart: typeof selectableField.selectionStart === 'number' ? selectableField.selectionStart : undefined,
         selectionEnd: typeof selectableField.selectionEnd === 'number' ? selectableField.selectionEnd : undefined,
@@ -5481,9 +6012,9 @@ export class BrowserSession {
     return { width: viewport.width, height: viewport.height };
   }
 
-  private async getViewportMetrics(): Promise<ViewportMetrics> {
-    const fallback = this.activePage.viewportSize() || { width: 1280, height: 720 };
-    return this.activePage.evaluate(() => ({
+  private async getViewportMetrics(page = this.activePage): Promise<ViewportMetrics> {
+    const fallback = page.viewportSize() || { width: 1280, height: 720 };
+    return page.evaluate(() => ({
       width: window.innerWidth,
       height: window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -6938,10 +7469,9 @@ export class BrowserSession {
     const validation = await locator.evaluate((element) => {
       const target = element as HTMLElement;
       const style = window.getComputedStyle(target);
-      const disabled = Boolean(
-        (target as HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled
-        || target.getAttribute('aria-disabled') === 'true',
-      );
+      const disabled = (window as WindowWithAiDomRuntime).__aiDomRuntime?.isDisabledElement(target)
+        ?? Boolean((target as HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled
+          || target.getAttribute('aria-disabled') === 'true');
       const rect = target.getBoundingClientRect();
       const ratios = [
         [0.5, 0.5], [0.2, 0.5], [0.8, 0.5], [0.5, 0.2], [0.5, 0.8],
@@ -7047,7 +7577,8 @@ export class BrowserSession {
           const rect = element.getBoundingClientRect();
           return {
             connected: element.isConnected,
-            disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+            disabled: (window as WindowWithAiDomRuntime).__aiDomRuntime?.isDisabledElement(element)
+              ?? Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
             visible: rect.width > 0 && rect.height > 0
               && style.display !== 'none'
               && style.visibility !== 'hidden'

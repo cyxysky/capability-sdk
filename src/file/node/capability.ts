@@ -6,8 +6,8 @@ import type {
 } from '../../index.ts';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { nodeArtifactRelativePath, sanitizeNodeArtifactFileName } from './artifacts.ts';
-import { readFileAttachment, readFileVisuals } from './read.ts';
 import { fileFormatForName } from '../formats.ts';
 import {
   createFileCapability,
@@ -18,10 +18,10 @@ import {
   type FileToolInput,
   type FileVisualToolInput,
 } from '../index.ts';
-import {
-  createNodeFileWorkspace,
-  type FileGenerationProgress,
-  type NodeFileWorkspaceHost,
+import type {
+  FileGenerationProgress,
+  NodeFileWorkspaceHost,
+  NodeFileWorkspace,
 } from './workspace.ts';
 import { CodedError, ERROR_CODES } from '../../errors.ts';
 
@@ -31,6 +31,8 @@ type ContextValue<T> = T | ((context: CapabilityRunContext) => T | Promise<T>);
 export type NodeFileCapabilityOptions = {
   workspace: ContextValue<NodeFileWorkspaceHost>;
   visualInputAvailable: boolean;
+  /** Local workspace hosts can read artifacts across calls and tool providers. */
+  artifactReadScope?: 'run' | 'workspace';
   attachmentBindings?: ContextValue<readonly FileAttachmentBinding[] | undefined>;
   sourcePageUrl?: ContextValue<string | undefined>;
   includeVisualVerification?: boolean;
@@ -99,7 +101,8 @@ export function fileOperationToCapabilityResult(
   const payload = record(data);
   const artifactId = typeof payload?.artifactId === 'string' ? payload.artifactId : undefined;
   const downloadUrl = typeof payload?.downloadUrl === 'string' ? payload.downloadUrl : undefined;
-  const mediaType = typeof payload?.mimeType === 'string' ? payload.mimeType : undefined;
+  const mediaType = typeof payload?.mimeType === 'string' ? payload.mimeType
+    : typeof payload?.mediaType === 'string' ? payload.mediaType : undefined;
   const content = [
     ...(artifactId ? [{
       type: 'artifact' as const,
@@ -141,13 +144,16 @@ export async function createNodeFileOperations(
       ? resolveContextValue(options.sourcePageUrl, runContext)
       : undefined,
   ]);
-  const workspace = createNodeFileWorkspace({
-    ...workspaceHost,
-    configuration: {
-      ...runContext.configuration,
-      ...workspaceHost.configuration,
-    },
-  });
+  // Tool discovery and text writes do not need Office engines or parsers.
+  let workspace: Promise<NodeFileWorkspace> | undefined;
+  let disposed = false;
+  const getWorkspace = () => {
+    if (disposed) throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, 'File workspace is closed.');
+    return workspace ||= import('./workspace.ts').then(({ createNodeFileWorkspace }) => createNodeFileWorkspace({
+      ...workspaceHost,
+      configuration: { ...runContext.configuration, ...workspaceHost.configuration },
+    })).catch(error => { workspace = undefined; throw error; });
+  };
   const attachmentBindings = configuredBindings ? [...configuredBindings] : undefined;
   const runId = runContext.runId;
   const includeVisualVerification = options.includeVisualVerification === true;
@@ -157,16 +163,18 @@ export async function createNodeFileOperations(
     nodeArtifactRelativePath(root, candidate);
     const absolutePath = await realpath(candidate);
     const relative = nodeArtifactRelativePath(root, absolutePath).relativePath;
-    if (!relative.startsWith(`${sanitizeNodeArtifactFileName(runId, 'adhoc')}/`)) throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, 'Artifact does not belong to this run.');
+    if (options.artifactReadScope !== 'workspace' && !relative.startsWith(`${sanitizeNodeArtifactFileName(runId, 'adhoc')}/`)) {
+      throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, 'Artifact does not belong to this run.');
+    }
     return absolutePath;
   };
 
   const file: FileCapabilityRuntimeOperations['file'] = {
     list: async () => fileOperationToCapabilityResult(
-      await workspace.listOfficeDrafts({ runId }),
+      await (await getWorkspace()).listOfficeDrafts({ runId }),
       ERROR_CODES.FILE_LIST_FAILED,
     ),
-    readSource: async (input, context) => fileOperationToCapabilityResult(await workspace.readUnoDraft({
+    readSource: async (input, context) => fileOperationToCapabilityResult(await (await getWorkspace()).readUnoDraft({
       abortSignal: context.abortSignal,
       runId,
       documentId: input.documentId,
@@ -186,6 +194,7 @@ export async function createNodeFileOperations(
             absolutePath = await resolveRunArtifact(input.artifactId);
             name = path.basename(absolutePath);
           } else return unavailable('Use an artifactId from this run or a registered attachmentId.');
+          const { readFileAttachment } = await import('./read.ts');
           return fileOperationToCapabilityResult(await readFileAttachment({ ...input, absolutePath,
             abortSignal: context.abortSignal, previewRoot: path.join(workspaceHost.artifactsRoot, sanitizeNodeArtifactFileName(runId, 'adhoc'), 'attachment-previews'),
             attachment: { id: input.artifactId || input.attachmentId!, name, path: absolutePath,
@@ -199,12 +208,16 @@ export async function createNodeFileOperations(
         ...input, includeVisuals: input.includeVisuals === true,
       }, context, runContext), ERROR_CODES.FILE_READ_CONTENT_FAILED);
     },
-    write: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.writeTextFileArtifact({ fileName: input.fileName, content: input.content, runId, abortSignal: context.abortSignal }),
-      ERROR_CODES.FILE_WRITE_FAILED,
-    ),
+    write: async (input: FileToolInput, context) => {
+      if (disposed) throw new CodedError(ERROR_CODES.FILE_OPERATION_FAILED, 'File workspace is closed.');
+      const { writeTextFileArtifact } = await import('./write.ts');
+      return fileOperationToCapabilityResult(await writeTextFileArtifact({
+        artifactsRoot: path.resolve(workspaceHost.artifactsRoot),
+        artifactUrl: workspaceHost.artifactUrl || ((artifact) => pathToFileURL(artifact.absolutePath).href),
+      }, { fileName: input.fileName, content: input.content, runId, abortSignal: context.abortSignal }), ERROR_CODES.FILE_WRITE_FAILED);
+    },
     download: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.downloadFileArtifact({
+      await (await getWorkspace()).downloadFileArtifact({
         runId,
         url: input.url,
         path: input.path,
@@ -216,7 +229,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_DOWNLOAD_FAILED,
     ),
     convert: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.convertFileArtifact({
+      await (await getWorkspace()).convertFileArtifact({
         runId,
         sourceArtifactId: input.sourceArtifactId,
         fileName: input.fileName,
@@ -225,7 +238,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_CONVERT_FAILED,
     ),
     plan: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.planFileArtifact({
+      await (await getWorkspace()).planFileArtifact({
         abortSignal: context.abortSignal,
         runId,
         documentId: input.documentId,
@@ -240,7 +253,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_PLAN_FAILED,
     ),
     unoApi: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.getUnoApi({
+      await (await getWorkspace()).getUnoApi({
         abortSignal: context.abortSignal,
         runId,
         documentId: input.documentId,
@@ -252,7 +265,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_UNO_API_FAILED,
     ),
     jsApi: async (input: FileToolInput) => fileOperationToCapabilityResult(
-      await workspace.getOfficeJsApi({
+      await (await getWorkspace()).getOfficeJsApi({
         runId,
         documentId: input.documentId,
         documentType: input.documentType,
@@ -260,7 +273,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_JS_API_FAILED,
     ),
     generate: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.generateUnoFileArtifact({
+      await (await getWorkspace()).generateUnoFileArtifact({
         runId,
         documentId: input.documentId,
         program: input.program,
@@ -274,7 +287,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_GENERATE_FAILED,
     ),
     edit: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.editUnoFileArtifact({
+      await (await getWorkspace()).editUnoFileArtifact({
         runId,
         documentId: input.documentId,
         path: input.path,
@@ -290,7 +303,7 @@ export async function createNodeFileOperations(
       ERROR_CODES.FILE_EDIT_FAILED,
     ),
     render: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
-      await workspace.renderFileArtifact({
+      await (await getWorkspace()).renderFileArtifact({
         runId,
         documentId: input.documentId,
         includeVisualVerification,
@@ -312,7 +325,7 @@ export async function createNodeFileOperations(
   } satisfies NonNullable<FileCapabilityRuntimeOperations['visual']> : undefined;
 
   async function executeVisual(input: FileVisualToolInput, context: CapabilityExecutionContext) {
-    const current = await workspace.verifyCurrentUnoRenderedArtifact({
+    const current = await (await getWorkspace()).verifyCurrentUnoRenderedArtifact({
       runId,
       artifactId: input.artifactId,
     });
@@ -324,6 +337,7 @@ export async function createNodeFileOperations(
       else {
         const absolutePath = await resolveRunArtifact(input.artifactId);
         const name = path.basename(absolutePath);
+        const { readFileVisuals } = await import('./read.ts');
         visualResult = await readFileVisuals({ absolutePath, request: input,
           previewRoot: path.join(workspaceHost.artifactsRoot, sanitizeNodeArtifactFileName(runId, 'adhoc'), 'attachment-previews'),
           attachment: { id: input.artifactId, name, path: absolutePath, type: fileFormatForName(name)?.mimeType || 'application/octet-stream', url: '' },
@@ -333,7 +347,7 @@ export async function createNodeFileOperations(
       return fileOperationToCapabilityResult({ ok: false, actual: error instanceof Error ? error.message : String(error) }, ERROR_CODES.FILE_VISUAL_READ_FAILED);
     }
     context.abortSignal?.throwIfAborted();
-    return fileOperationToCapabilityResult(await workspace.recordOfficeVisualQaProgress({
+    return fileOperationToCapabilityResult(await (await getWorkspace()).recordOfficeVisualQaProgress({
       runId,
       artifactId: input.artifactId,
       action: input.action,
@@ -344,8 +358,13 @@ export async function createNodeFileOperations(
   return {
     file,
     visual,
-    health: () => workspace.health(),
-    dispose: () => workspace.dispose(),
+    health: async () => (await getWorkspace()).health(),
+    async dispose() {
+      disposed = true;
+      const pending = workspace;
+      workspace = undefined;
+      await (await pending)?.dispose();
+    },
   };
 }
 

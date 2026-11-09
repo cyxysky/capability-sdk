@@ -8,11 +8,25 @@ const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { runtimeDirectory, readManagedRuntime } = require('../runtime/managed/layout.cjs');
+const { runtimeDirectory, readManagedRuntime, readManagedSensitiveDataRuntime } = require('../runtime/managed/layout.cjs');
 const spec = require('../runtime/managed/spec.json');
+const runtimeFields = { browser: ['chromium'], file: ['python', 'libreoffice', 'unoPython', 'chromium'],
+  media: ['ffmpeg', 'chromium'], code: ['python'], all: ['python', 'libreoffice', 'unoPython', 'chromium', 'ffmpeg'] };
 const packageRoot = path.resolve(__dirname, '..');
 const requirements = path.join(packageRoot, 'runtime', 'sensitive-data', 'python', 'requirements.txt');
-const log = message => process.stderr.write(`[capability-sdk] ${message}\n`);
+let installationStatus;
+function writeInstallStatus(patch) {
+  installationStatus = { ...installationStatus, ...patch, pid: process.pid, updatedAt: new Date().toISOString() };
+  const directory = runtimeDirectory();
+  fs.mkdirSync(directory, { recursive: true });
+  const temporary = path.join(directory, `sensitive-data-status-${process.pid}.tmp`);
+  fs.writeFileSync(temporary, JSON.stringify(installationStatus));
+  fs.renameSync(temporary, path.join(directory, 'sensitive-data-status.json'));
+}
+const log = message => {
+  process.stderr.write(`[capability-sdk] ${message}\n`);
+  if (installationStatus?.state === 'installing') writeInstallStatus({ message });
+};
 
 function platformPlan(platform = process.platform, arch = process.arch, osRelease) {
   const uv = spec.uv[`${platform}-${arch}`];
@@ -29,14 +43,12 @@ function platformPlan(platform = process.platform, arch = process.arch, osReleas
     platform, arch, uv,
     steps: [platform === 'win32' ? 'Copy LibreOffice/UNO into the project or extract the verified Windows MSI there' : 'Prepare OS libraries through apt; copy LibreOffice/PyUNO into the project and use a matching managed Python',
       'Install a managed Python 3.11 environment with uv',
-      'Install CPU PyTorch and sensitive-data Python dependencies',
-      'Download all three default sensitive-data models',
       'Install the matching Playwright Chromium and validate a headless launch',
       'Validate LibreOffice, PyUNO, FFmpeg and Python; then atomically record ready state'],
   };
 }
 
-function run(command, args, { env = process.env, cwd, capture = false, timeout = 30 * 60_000, accepted = [0] } = {}) {
+function run(command, args, { env = process.env, cwd, capture = false, captureStderr = false, timeout = 30 * 60_000, accepted = [0] } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env, cwd, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '', errors = '', timedOut = false;
@@ -55,7 +67,7 @@ function run(command, args, { env = process.env, cwd, capture = false, timeout =
     child.once('close', code => {
       clearTimeout(timer);
       if (timedOut) reject(new Error(`${path.basename(command)} timed out after ${timeout}ms.`));
-      else if (accepted.includes(code)) resolve(output.trim());
+      else if (accepted.includes(code)) resolve((captureStderr ? output + '\n' + errors : output).trim());
       else reject(new Error(`${path.basename(command)} exited with ${code}: ${errors || output}`));
     });
   });
@@ -154,12 +166,7 @@ async function installOffice(cache) {
   const local = await officeCandidates(cache);
   if (local) return local;
   if (process.platform === 'linux') {
-    const packagesPresent = await works('dpkg-query', ['-W', '-f=${db:Status-Status}\n', ...spec.linuxPackages]);
-    const statuses = packagesPresent ? await run('dpkg-query', ['-W', '-f=${db:Status-Status}\n', ...spec.linuxPackages], { capture: true }) : '';
-    if (!packagesPresent || statuses.split('\n').some(status => status !== 'installed')) {
-      await privileged('apt-get', ['update']);
-      await privileged('apt-get', ['install', '-y', '--no-install-recommends', ...spec.linuxPackages]);
-    }
+    return require('../runtime/managed/linux-system.cjs').installOffice(cache, spec.linuxPackages, run);
   }
   const system = await officeCandidates(cache, true);
   if (system) {
@@ -172,7 +179,7 @@ async function installOffice(cache) {
     if (process.platform === 'linux') {
       const version = await run(system.unoPython, ['-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'], { capture: true });
       const uv = findFile(path.join(cache, `uv-${spec.uvVersion}`), 'uv');
-      await run(uv, ['python', 'install', version], { env: pythonEnvironment(cache) });
+      await run(uv, ['python', 'install', '--no-bin', version], { env: pythonEnvironment(cache) });
       const python = await run(uv, ['python', 'find', '--managed-python', version], { env: pythonEnvironment(cache), capture: true });
       for (const module of ['uno', 'unohelper', 'pyuno']) {
         const filename = await run(system.unoPython, ['-c', `import ${module}; print(${module}.__file__)`], { env: unoEnvironment(system.libreoffice, system.unoPython), capture: true });
@@ -201,10 +208,10 @@ async function privileged(command, args) {
 }
 
 function pythonEnvironment(cache) {
-  return { ...process.env, UV_PYTHON_INSTALL_DIR: path.join(cache, 'python'), UV_PYTHON_BIN_DIR: path.join(cache, 'python-bin'), UV_CACHE_DIR: path.join(cache, 'uv-cache'), UV_NO_PROGRESS: '1' };
+  return { ...process.env, UV_PYTHON_INSTALL_DIR: path.join(cache, 'python'), UV_CACHE_DIR: path.join(cache, 'uv-cache'), UV_NO_PROGRESS: '1' };
 }
 
-async function installPython(cache, plan) {
+async function installPython(cache, plan, { venv = path.join(cache, 'venv') } = {}) {
   const directory = path.join(cache, `uv-${spec.uvVersion}`);
   let uv = findFile(directory, process.platform === 'win32' ? 'uv.exe' : 'uv');
   if (!uv) {
@@ -219,10 +226,31 @@ async function installPython(cache, plan) {
   }
   if (!uv) throw new Error('The verified uv archive did not contain the expected executable.');
   const env = pythonEnvironment(cache);
-  await run(uv, ['python', 'install', spec.pythonVersion], { env });
-  const venv = path.join(cache, 'venv');
+  // All consumers use explicit paths, so Python needs no bin launcher or Windows registry entry.
+  await run(uv, ['python', 'install', '--no-bin', ...(process.platform === 'win32' ? ['--no-registry'] : []), spec.pythonVersion], { env });
   const python = path.join(venv, process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-  if (!fs.existsSync(python)) await run(uv, ['venv', '--seed', '--managed-python', '--python', spec.pythonVersion, venv], { env });
+  const probe = ['-c', [
+    'import os, sys',
+    'normalize = lambda value: os.path.normcase(os.path.realpath(value))',
+    'expected = tuple(map(int, sys.argv[1].split(".")))',
+    'assert sys.version_info[:len(expected)] == expected',
+    'assert normalize(sys.prefix) == normalize(sys.argv[2])',
+    'assert normalize(sys.prefix) != normalize(sys.base_prefix)',
+    'assert os.path.commonpath([normalize(sys.base_prefix), normalize(sys.argv[3])]) == normalize(sys.argv[3])',
+  ].join('\n'), spec.pythonVersion, venv, env.UV_PYTHON_INSTALL_DIR];
+  if (!await works(python, probe, { env })) {
+    log('Creating or repairing the project-local Python virtual environment.');
+    // This directory belongs to the SDK; clear broken and incomplete environments before recreating it.
+    await run(uv, ['venv', '--clear', '--force', '--seed', '--relocatable', '--managed-python', '--python', spec.pythonVersion, venv], { env });
+    await run(python, probe, { env, capture: true });
+  }
+  return python;
+}
+
+async function installSensitiveDataPython(cache, plan) {
+  const python = await installPython(cache, plan, { venv: path.join(cache, 'sensitive-data', 'venv') });
+  const uv = findFile(path.join(cache, `uv-${spec.uvVersion}`), process.platform === 'win32' ? 'uv.exe' : 'uv');
+  const env = pythonEnvironment(cache);
   await run(uv, ['pip', 'install', '--python', python, '--index-url', 'https://download.pytorch.org/whl/cpu', 'torch>=2.2,<3'], { env });
   await run(uv, ['pip', 'install', '--python', python, '-r', requirements], { env });
   return python;
@@ -231,46 +259,80 @@ async function installPython(cache, plan) {
 async function installModels(cache, python) {
   const models = {};
   for (const [key, repository] of Object.entries(spec.models)) {
-    models[key] = path.join(cache, 'models', key);
+    models[key] = path.join(cache, 'sensitive-data', 'models', key);
     log(`Preparing model ${repository}`);
     await run(python, ['-c', 'from huggingface_hub import snapshot_download; import sys; snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2], allow_patterns=["*.json", "*.txt", "*.py", "*.model", "*.safetensors", "pytorch_model*.bin", "LICENSE*", "README.md"])', repository, models[key]], {
       // The optional Xet transport can stall before writing any bytes behind
       // some proxies. HTTP supports resuming downloads and works through the
       // same proxy path as metadata requests. Users can opt into Xet with 0.
-      timeout: 2 * 60 * 60_000, env: { ...process.env, HF_HOME: path.join(cache, 'huggingface'), HF_HUB_CACHE: process.env.HF_HUB_CACHE || path.join(cache, 'huggingface', 'hub'), HF_XET_CACHE: path.join(cache, 'huggingface', 'xet'), HF_HUB_DISABLE_XET: process.env.HF_HUB_DISABLE_XET ?? '1' },
+      timeout: 2 * 60 * 60_000, env: { ...process.env, HF_HOME: path.join(cache, 'sensitive-data', 'huggingface'), HF_HUB_CACHE: process.env.HF_HUB_CACHE || path.join(cache, 'sensitive-data', 'huggingface', 'hub'), HF_XET_CACHE: path.join(cache, 'sensitive-data', 'huggingface', 'xet'), HF_HUB_DISABLE_XET: process.env.HF_HUB_DISABLE_XET ?? '1' },
     });
   }
   return models;
 }
 
 function fingerprint() {
-  return createHash('sha256').update(JSON.stringify(spec)).update(fs.readFileSync(requirements)).update(require('patchright/package.json').version).update(require('ffmpeg-static/package.json').version).digest('hex');
+  const { uvVersion, pythonVersion, uv, libreoffice, linuxPackages } = spec;
+  const patchrightRoot = path.dirname(require.resolve('patchright/package.json'));
+  const coreRoot = path.dirname(require.resolve('patchright-core/package.json', { paths: [patchrightRoot] }));
+  return createHash('sha256').update(JSON.stringify({ uvVersion, pythonVersion, uv, libreoffice, linuxPackages }))
+    .update(require('patchright/package.json').version).update(fs.readFileSync(path.join(coreRoot, 'browsers.json')))
+    .update(require('ffmpeg-static/package.json').version).digest('hex');
 }
 
-async function verify(runtime, { loadModels = false } = {}) {
+function chromiumExecutable(cache) {
+  return run(process.execPath, ['-e', "console.log(require('patchright').chromium.executablePath())"], {
+    cwd: packageRoot, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: path.join(cache, 'browsers') }, capture: true,
+  });
+}
+
+function runtimeManifest(runtime, directory) {
+  const relativePath = filename => {
+    const relative = path.relative(directory, filename);
+    if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error('Runtime path is outside the project runtime: ' + filename);
+    return relative.split(path.sep).join('/');
+  };
+  const record = { ...runtime };
+  for (const key of ['python', 'libreoffice', 'unoPython', 'chromium', 'ffmpeg']) {
+    if (key in record) record[key] = relativePath(record[key]);
+  }
+  if (record.models) record.models = Object.fromEntries(Object.entries(record.models).map(([key, filename]) => [key, relativePath(filename)]));
+  return record;
+}
+
+async function verify(runtime, { loadModels = false, sensitiveOnly = false, fields } = {}) {
   const failures = [];
-  for (const [name, executable, args, options] of [
+  const checks = sensitiveOnly ? [
     ['Python dependencies', runtime?.python, ['-c', 'import torch, gliner2, transformers, uvicorn, fastapi; from huggingface_hub import snapshot_download'], { timeout: 120000 }],
+  ] : [
+    ['Python', runtime?.python, ['-c', 'import sys, venv']],
     ['LibreOffice', runtime?.libreoffice, ['--headless', '--version']],
     ['PyUNO', runtime?.unoPython, ['-c', 'import uno'], runtime?.libreoffice ? { env: unoEnvironment(runtime.libreoffice, runtime.unoPython), cwd: path.dirname(runtime.libreoffice) } : {}],
     ['FFmpeg', runtime?.ffmpeg, ['-version']],
-  ]) if (!await works(executable, args, options)) failures.push(name);
-  for (const key of Object.keys(spec.models)) {
+  ];
+  const fieldNames = { Python: 'python', LibreOffice: 'libreoffice', PyUNO: 'unoPython', FFmpeg: 'ffmpeg' };
+  for (const [name, executable, args, options] of checks) {
+    if (fields && !fields.includes(fieldNames[name])) continue;
+    if (!await works(executable, args, options)) failures.push(name);
+  }
+  if (sensitiveOnly) for (const key of Object.keys(spec.models)) {
     const directory = runtime?.models?.[key];
     if (!directory || !fs.existsSync(path.join(directory, 'config.json')) || !fs.readdirSync(directory).some(name => /\.(safetensors|bin)$/.test(name))) failures.push(`model ${key}`);
   }
-  if (loadModels && !failures.some(name => name.startsWith('model ') || name === 'Python dependencies')) {
+  if (sensitiveOnly && loadModels && !failures.some(name => name.startsWith('model ') || name === 'Python dependencies')) {
     try {
-      const huggingFaceHome = path.join(runtimeDirectory(), 'huggingface');
+      const huggingFaceHome = path.join(runtimeDirectory(), 'sensitive-data', 'huggingface');
       await run(runtime.python, ['-c', 'import app; assert app.health()["status"] == "ok"; print("All sensitive-data models loaded offline")'], {
         capture: true, timeout: 10 * 60_000, cwd: path.join(packageRoot, 'runtime', 'sensitive-data', 'python'),
         env: { ...process.env, GLINER_MODEL: runtime.models.gliner, GLINER_CHINESE_NER_MODEL: runtime.models.chinese, GLINER_PII_MODEL: runtime.models.pii, GLINER_DEVICE: 'cpu', HF_HOME: huggingFaceHome, HF_HUB_CACHE: path.join(huggingFaceHome, 'hub'), HF_MODULES_CACHE: path.join(huggingFaceHome, 'modules'), TRANSFORMERS_CACHE: path.join(huggingFaceHome, 'hub'), HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', PYTHONDONTWRITEBYTECODE: '1' },
       });
     } catch (error) { failures.push(`Sensitive-data model loading: ${error.message.slice(-3000)}`); }
   }
+  if (sensitiveOnly || fields && !fields.includes('chromium')) return failures;
   try {
     if (!runtime?.chromium || !fs.existsSync(runtime.chromium)) throw new Error('Chromium is missing');
-    const browser = await require('patchright').chromium.launch({ executablePath: runtime.chromium, headless: true, timeout: 30000 });
+    if (path.resolve(runtime.chromium) !== path.resolve(await chromiumExecutable(runtimeDirectory()))) throw new Error('Recorded Chromium does not match the installed Patchright revision; run capability-runtime install');
+    const browser = await require('patchright').chromium.launch({ executablePath: runtime.chromium, headless: true, args: process.getuid?.() === 0 ? ['--no-sandbox'] : [], timeout: 30000 });
     try { const page = await browser.newPage(); await page.setContent('<p>runtime ready</p>'); if (await page.textContent('p') !== 'runtime ready') throw new Error('Render failed'); }
     finally { await browser.close(); }
   } catch (error) { failures.push(`Chromium: ${error.message}`); }
@@ -296,7 +358,9 @@ async function acquireLock(directory) {
   }
 }
 
-async function install() {
+async function install(component = 'all') {
+  const fields = runtimeFields[component];
+  if (!fields) throw new Error('Select one runtime component: browser, file, media or code.');
   const plan = platformPlan();
   const cache = runtimeDirectory();
   await fsp.mkdir(cache, { recursive: true });
@@ -304,59 +368,114 @@ async function install() {
   await acquireLock(lock);
   try {
     const existing = readManagedRuntime();
-    if (existing?.fingerprint === fingerprint() && !(await verify(existing)).length) { log('All runtimes are already ready.'); return existing; }
-    // An interrupted repair must not leave a stale ready marker.
-    await fsp.rm(path.join(cache, 'runtime.json'), { force: true });
-    const python = await installPython(cache, plan);
-    const office = await installOffice(cache);
-    const models = await installModels(cache, python);
-    const cli = path.join(path.dirname(require.resolve('patchright/package.json')), 'cli.js');
-    if (process.platform === 'linux' && !await works(process.execPath, [cli, 'install-deps', '--dry-run', 'chromium'])) await privileged(process.execPath, [cli, 'install-deps', 'chromium']);
-    const browserEnvironment = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: path.join(cache, 'browsers') };
-    await run(process.execPath, [cli, 'install', 'chromium'], { env: browserEnvironment });
-    const chromium = await run(process.execPath, ['-e', "console.log(require('patchright').chromium.executablePath())"], { cwd: packageRoot, env: browserEnvironment, capture: true });
-    const ffmpegSource = require('ffmpeg-static');
-    if (!ffmpegSource || !fs.existsSync(ffmpegSource)) throw new Error('ffmpeg-static did not install its executable. Check whether npm dependency scripts were disabled.');
-    const ffmpeg = path.join(cache, 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-    await fsp.mkdir(path.dirname(ffmpeg), { recursive: true });
-    await fsp.copyFile(ffmpegSource, ffmpeg);
-    if (process.platform !== 'win32') await fsp.chmod(ffmpeg, 0o755);
-    const runtime = { format: 2, status: 'ready', platform: process.platform, arch: process.arch, fingerprint: fingerprint(), python, ...office, models, chromium, ffmpeg };
-    for (const executable of [python, office.libreoffice, office.unoPython, chromium, ffmpeg]) {
+    if (existing && !(await verify(existing, { fields })).length) { log(component + ' runtime is already ready.'); return existing; }
+    const runtime = { ...existing, format: 2, status: 'ready', platform: process.platform, arch: process.arch,
+      fingerprint: createHash('sha256').update(JSON.stringify({ component, fields, spec })).digest('hex') };
+    if (fields.includes('python')) runtime.python = await installPython(cache, plan);
+    if (fields.includes('libreoffice')) Object.assign(runtime, await installOffice(cache));
+    if (fields.includes('chromium')) {
+      const cli = path.join(path.dirname(require.resolve('patchright/package.json')), 'cli.js');
+      if (process.platform === 'linux') {
+        const apt = await require('../runtime/managed/linux-system.cjs').prepareApt(cache, run);
+        const command = await run(process.execPath, [cli, 'install-deps', '--dry-run', 'chromium'], { capture: true, captureStderr: true, accepted: [0, 1], env: apt.environment });
+        const packages = [...command.matchAll(/^\s{2}([a-z0-9][a-z0-9+.-]*)\s*$/gm)].map(match => match[1]);
+        if (packages.length) await require('../runtime/managed/linux-system.cjs').installSystemPackages(cache, packages, run);
+        else if (command && !/all system dependencies are installed/i.test(command)) throw new Error('Cannot resolve Chromium system dependencies: ' + command);
+      }
+      const browserEnvironment = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: path.join(cache, 'browsers') };
+      await run(process.execPath, [cli, 'install', '--no-shell', 'chromium'], { env: browserEnvironment });
+      runtime.chromium = await chromiumExecutable(cache);
+      if (process.platform === 'linux') await require('../runtime/managed/linux-system.cjs').wrapExecutable(cache, runtime.chromium);
+    }
+    if (fields.includes('ffmpeg')) {
+      const ffmpegSource = require('ffmpeg-static');
+      if (!ffmpegSource || !fs.existsSync(ffmpegSource)) throw new Error('FFmpeg is missing from this tool component.');
+      runtime.ffmpeg = path.join(cache, 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+      await fsp.mkdir(path.dirname(runtime.ffmpeg), { recursive: true });
+      await fsp.copyFile(ffmpegSource, runtime.ffmpeg);
+      if (process.platform !== 'win32') await fsp.chmod(runtime.ffmpeg, 0o755);
+    }
+    for (const executable of fields.map(key => runtime[key]).filter(Boolean)) {
       const relative = path.relative(cache, executable);
       if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error(`Runtime executable is outside the project runtime: ${executable}`);
     }
-    const failures = await verify(runtime, { loadModels: true });
+    const failures = await verify(runtime, { fields });
     if (failures.length) throw new Error(`Runtime validation failed: ${failures.join('; ')}`);
     const temporary = path.join(cache, `runtime-${process.pid}.json`);
-    await fsp.writeFile(temporary, JSON.stringify(runtime, null, 2) + '\n');
+    await fsp.writeFile(temporary, JSON.stringify(runtimeManifest(runtime, cache), null, 2) + '\n');
     await fsp.rename(temporary, path.join(cache, 'runtime.json'));
-    log(`All runtimes ready: ${cache}`);
+    log(`${component} runtime ready: ${cache}`);
     return runtime;
+  } finally { await fsp.unlink(path.join(lock, 'owner.json')); await fsp.rmdir(lock); }
+}
+
+function sensitiveDataFingerprint() {
+  const hash = createHash('sha256').update(JSON.stringify({ python: spec.pythonVersion, uv: spec.uvVersion, models: spec.models })).update(fs.readFileSync(requirements));
+  for (const filename of ['app.py', 'candidate_resolution.py', 'entity_boundaries.py', 'deterministic_spans.py']) hash.update(fs.readFileSync(path.join(packageRoot, 'runtime', 'sensitive-data', 'python', filename)));
+  return hash.digest('hex');
+}
+
+async function installSensitiveData() {
+  const cache = runtimeDirectory(), lock = path.join(cache, '.install-lock');
+  await fsp.mkdir(cache, { recursive: true });
+  writeInstallStatus({ state: 'installing', step: 0, totalSteps: 4, phase: 'waiting', message: 'Waiting for runtime installation lock', startedAt: new Date().toISOString(), error: undefined });
+  await acquireLock(lock);
+  try {
+    const existing = readManagedSensitiveDataRuntime();
+    if (existing?.fingerprint === sensitiveDataFingerprint() && !(await verify(existing, { sensitiveOnly: true })).length) {
+      writeInstallStatus({ state: 'ready', step: 4, phase: 'ready', message: 'Sensitive-data runtime is ready' });
+      return existing;
+    }
+    writeInstallStatus({ phase: 'python', step: 1, message: 'Downloading Python and CPU inference dependencies' });
+    const python = existing?.python && !(await verify(existing, { sensitiveOnly: true })).length
+      ? existing.python : await installSensitiveDataPython(cache, platformPlan());
+    writeInstallStatus({ phase: 'models', step: 2, message: 'Downloading the three sensitive-data models' });
+    const models = existing?.models || await installModels(cache, python);
+    writeInstallStatus({ phase: 'verify', step: 3, message: 'Loading all models offline to verify readiness' });
+    const runtime = { format: 1, status: 'ready', platform: process.platform, arch: process.arch, fingerprint: sensitiveDataFingerprint(), python, models };
+    const failures = await verify(runtime, { sensitiveOnly: true, loadModels: true });
+    if (failures.length) throw new Error(failures.join('; '));
+    const temporary = path.join(cache, `sensitive-data-${process.pid}.tmp`);
+    await fsp.writeFile(temporary, JSON.stringify(runtimeManifest(runtime, cache), null, 2));
+    await fsp.rename(temporary, path.join(cache, 'sensitive-data.json'));
+    writeInstallStatus({ state: 'ready', step: 4, phase: 'ready', message: 'Sensitive-data runtime is ready' });
+    return runtime;
+  } catch (error) {
+    writeInstallStatus({ state: 'failed', phase: 'failed', message: 'Installation failed; retry to resume cached downloads', error: String(error.message || error).slice(-3000) });
+    throw error;
   } finally { await fsp.unlink(path.join(lock, 'owner.json')); await fsp.rmdir(lock); }
 }
 
 async function main(args = process.argv.slice(2)) {
   if (process.env.npm_lifecycle_event === 'postinstall') {
-    const project = process.env.npm_config_local_prefix || process.env.INIT_CWD;
-    if (!project) throw new Error('Cannot locate the consuming npm project. Run capability-runtime install from its root directory.');
-    process.chdir(project);
+    log('Runtime components are installed on demand. Use capability-runtime install <component> or the host tool installer.');
+    return;
   }
   const command = args[0] || 'install';
+  if (args[1] === 'sensitive-data') {
+    if (command === 'install') { await installSensitiveData(); return; }
+    if (command === 'doctor') {
+      const runtime = readManagedSensitiveDataRuntime();
+      const failures = await verify(runtime, { sensitiveOnly: true, loadModels: true });
+      process.stdout.write(JSON.stringify({ ready: !!runtime && !failures.length, failures, directory: runtimeDirectory() }) + '\n');
+      process.exitCode = runtime && !failures.length ? 0 : 1; return;
+    }
+  }
   if (command === 'plan') { process.stdout.write(JSON.stringify({ ...platformPlan(), directory: runtimeDirectory() }, null, 2) + '\n'); return; }
   if (command === 'doctor') {
     const runtime = readManagedRuntime();
-    const failures = await verify(runtime, { loadModels: true });
+    if (args[1] && !runtimeFields[args[1]]) throw new Error('Unknown runtime component.');
+    const fields = args[1] ? runtimeFields[args[1]] : runtimeFields.all.filter(field => runtime?.[field]);
+    const failures = await verify(runtime, { fields });
     if (!runtime) failures.unshift('No completed runtime installation');
-    else if (runtime.fingerprint !== fingerprint()) failures.push('Runtime dependencies changed; run capability-runtime install');
     process.stdout.write(JSON.stringify({ ready: failures.length === 0, directory: runtimeDirectory(), failures }, null, 2) + '\n');
     if (failures.length) process.exitCode = 1;
     return;
   }
   if (command !== 'install') throw new Error('Usage: capability-runtime [install|doctor|plan]');
   if (process.env.CAPABILITY_SKIP_RUNTIME_INSTALL === '1') { log('Runtime installation explicitly skipped; execution environments are NOT prepared. Run capability-runtime install later.'); return; }
-  await install();
+  await install(args[1] || 'all');
 }
 
-module.exports = { platformPlan, verify, install, main };
+module.exports = { platformPlan, verify, install, installSensitiveData, sensitiveDataFingerprint, main };
 if (require.main === module) main().catch(error => { log(error.message); process.exitCode = 1; });
